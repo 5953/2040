@@ -6,7 +6,7 @@
 #include "hardware/sync.h"
 
 #define SECTOR_SIZE 512
-static uint8_t s_buf[4096];
+static uint8_t s_buf[4096] __attribute__((aligned(4)));
 
 DSTATUS disk_initialize(BYTE drv) {
     return (drv == 0) ? 0 : STA_NOINIT;
@@ -18,7 +18,14 @@ DSTATUS disk_status(BYTE drv) {
 
 DRESULT disk_read(BYTE drv, BYTE* buf, LBA_t sector, UINT count) {
     if (drv != 0) return RES_NOTRDY;
+    if (count == 0) return RES_PARERR;
+
     uint32_t addr = XIP_BASE + FILESYSTEM_OFFSET + (uint32_t)sector * SECTOR_SIZE;
+    // 边界检查
+    if (FILESYSTEM_OFFSET + ((uint32_t)sector + count) * SECTOR_SIZE > 
+        FILESYSTEM_OFFSET + FILESYSTEM_SIZE) {
+        return RES_PARERR;
+    }
     memcpy(buf, (const void*)addr, (size_t)count * SECTOR_SIZE);
     return RES_OK;
 }
@@ -26,6 +33,12 @@ DRESULT disk_read(BYTE drv, BYTE* buf, LBA_t sector, UINT count) {
 DRESULT disk_write(BYTE drv, const BYTE* buf, LBA_t sector, UINT count) {
     if (drv != 0) return RES_NOTRDY;
     if (count == 0) return RES_PARERR;
+
+    // 边界检查
+    if (FILESYSTEM_OFFSET + ((uint32_t)sector + count) * SECTOR_SIZE > 
+        FILESYSTEM_OFFSET + FILESYSTEM_SIZE) {
+        return RES_PARERR;
+    }
 
     uint32_t total = (uint32_t)count * SECTOR_SIZE;
     uint32_t flash_off = FILESYSTEM_OFFSET + (uint32_t)sector * SECTOR_SIZE;
@@ -36,6 +49,7 @@ DRESULT disk_write(BYTE drv, const BYTE* buf, LBA_t sector, UINT count) {
         uint32_t block_off  = flash_off - block_base;
         uint32_t chunk = (total > (4096 - block_off)) ? (4096 - block_off) : total;
 
+        // 读出整块 → 修改 → 写回 (RMW)
         memcpy(s_buf, (const void*)(XIP_BASE + block_base), 4096);
         memcpy(s_buf + block_off, buf + written, chunk);
 
@@ -44,12 +58,12 @@ DRESULT disk_write(BYTE drv, const BYTE* buf, LBA_t sector, UINT count) {
         flash_range_program(block_base, s_buf, 4096);
         restore_interrupts(ints);
 
-        // ===== 读回验证 =====
-        __dsb();   // 确保内存序
+        // ★★★ 立刻读回验证 ★★★
+        __dsb();
         const uint8_t *verify = (const uint8_t *)(XIP_BASE + block_base + block_off);
         for (uint32_t i = 0; i < chunk; i++) {
             if (verify[i] != buf[written + i]) {
-                return RES_ERROR;   // ← 关键: 让 FatFs 知道写失败
+                return RES_ERROR;   // 让 FatFs 知道失败
             }
         }
 
