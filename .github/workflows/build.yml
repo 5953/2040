@@ -1,0 +1,78 @@
+name: Build RP2040 Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # 1. 获取 GitHub 仓库代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 安装编译工具
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            cmake \
+            ninja-build \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            build-essential \
+            git
+
+      # 3. 下载 Raspberry Pi Pico SDK
+      - name: Download Pico SDK
+        run: |
+          git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git
+          cd pico-sdk
+          git submodule update --init --depth 1
+
+      # 4. 准备 Pico SDK 导入文件
+      - name: Prepare Pico SDK
+        run: |
+          cp pico-sdk/external/pico_sdk_import.cmake .
+
+      # 5. 配置 CMake
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DPICO_SDK_PATH=$GITHUB_WORKSPACE/pico-sdk \
+            -DCMAKE_BUILD_TYPE=Release
+
+      # 6. 编译
+      - name: Build
+        run: |
+          cmake --build build --parallel 2 --verbose
+
+      # 7. 显示生成的文件
+      - name: List build files
+        run: |
+          echo "===== Build output ====="
+          find build -maxdepth 2 -type f \
+            \( -name "*.uf2" -o -name "*.bin" -o -name "*.hex" -o -name "*.elf" \) \
+            -print
+
+      # 8. 上传 UF2
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm_programmer-uf2
+          path: build/*.uf2
+          if-no-files-found: error
+
+      # 9. 上传其他固件文件
+      - name: Upload firmware files
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm_programmer-all
+          path: |
+            build/*.uf2
+            build/*.bin
+            build/*.hex
+            build/*.elf
+          if-no-files-found: warn
