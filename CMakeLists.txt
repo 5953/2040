@@ -56,6 +56,7 @@ message(STATUS "Using FatFs: ${FATFS_SOURCE_DIR}")
 file(GLOB FATFS_SOURCES "${FATFS_SOURCE_DIR}/ff.c" "${FATFS_SOURCE_DIR}/ffsystem.c" "${FATFS_SOURCE_DIR}/ffunicode.c")
 
 add_library(fatfs STATIC ${FATFS_SOURCES})
+target_compile_definitions(fatfs PUBLIC FF_USE_MKFS=1)
 target_include_directories(fatfs PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${FATFS_SOURCE_DIR}
