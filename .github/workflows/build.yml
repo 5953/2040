@@ -11,6 +11,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache apt packages
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential libstdc++-arm-none-eabi-newlib python3 git
+          version: 1.0
+
       - name: Cache Pico SDK
         uses: actions/cache@v4
         with:
@@ -18,12 +24,6 @@ jobs:
           key: pico-sdk-${{ runner.os }}-${{ hashFiles('**/pico_sdk_import.cmake', '**/CMakeLists.txt') }}
           restore-keys: |
             pico-sdk-${{ runner.os }}-
-
-      - name: Install ARM Toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
-            build-essential libstdc++-arm-none-eabi-newlib python3 git
 
       - name: Configure CMake
         run: |
