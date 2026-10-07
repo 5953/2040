@@ -8,18 +8,60 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-# FatFs: 从 fatfs/source/ 目录引用 (GitHub Actions 会自动下载)
-add_library(fatfs STATIC
-    fatfs/source/ff.c
-    fatfs/source/ffsystem.c
-    fatfs/source/ffunicode.c
+# ===== 自动查找 FatFs (来自 TinyUSB 库) =====
+# Pico SDK 下载后, TinyUSB 在 lib/tinyusb/, FatFs 在 lib/tinyusb/lib/fatfs/source/
+set(FATFS_SOURCE_DIR "")
+
+# 在 Pico SDK 的 TinyUSB 里找
+file(GLOB FATFS_CANDIDATES
+    "${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/source/ff.c"
+    "${PICO_SDK_PATH}/lib/tinyusb/lib/fatfs/ff.c"
+    "${CMAKE_CURRENT_BINARY_DIR}/_pico_sdk/pico-sdk/lib/tinyusb/lib/fatfs/source/ff.c"
 )
-# 项目根目录在前, 这样自定义 ffconf.h 优先于 FatFs 自带的
+if(FATFS_CANDIDATES)
+    list(GET FATFS_CANDIDATES 0 FIRST_MATCH)
+    get_filename_component(FATFS_SOURCE_DIR "${FIRST_MATCH}" DIRECTORY)
+    message(STATUS "FatFs found in TinyUSB: ${FATFS_SOURCE_DIR}")
+endif()
+
+# 如果没找到, 单独下载 TinyUSB (只需要 fatfs 部分)
+if(NOT FATFS_SOURCE_DIR)
+    message(STATUS "FatFs not in TinyUSB, downloading...")
+    include(FetchContent)
+    FetchContent_Declare(
+        tinyusb_fatfs
+        GIT_REPOSITORY https://github.com/hathach/tinyusb.git
+        GIT_TAG master
+        GIT_SHALLOW TRUE
+        GIT_SUBMODULES ""
+    )
+    FetchContent_Populate(tinyusb_fatfs)
+
+    file(GLOB FATFS_CANDIDATES2
+        "${tinyusb_fatfs_SOURCE_DIR}/lib/fatfs/source/ff.c"
+        "${tinyusb_fatfs_SOURCE_DIR}/lib/fatfs/ff.c"
+    )
+    if(FATFS_CANDIDATES2)
+        list(GET FATFS_CANDIDATES2 0 FIRST_MATCH2)
+        get_filename_component(FATFS_SOURCE_DIR "${FIRST_MATCH2}" DIRECTORY)
+        message(STATUS "FatFs found in downloaded TinyUSB: ${FATFS_SOURCE_DIR}")
+    endif()
+endif()
+
+if(NOT FATFS_SOURCE_DIR)
+    message(FATAL_ERROR "FatFs not found! 请检查 Pico SDK 是否正确下载")
+endif()
+
+message(STATUS "Using FatFs: ${FATFS_SOURCE_DIR}")
+file(GLOB FATFS_SOURCES "${FATFS_SOURCE_DIR}/ff.c" "${FATFS_SOURCE_DIR}/ffsystem.c" "${FATFS_SOURCE_DIR}/ffunicode.c")
+
+add_library(fatfs STATIC ${FATFS_SOURCES})
 target_include_directories(fatfs PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/fatfs/source
+    ${FATFS_SOURCE_DIR}
 )
 
+# ===== 主程序 =====
 add_executable(stm_programmer
     main.c
     oled_display.c
