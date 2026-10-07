@@ -1,8 +1,14 @@
 #ifndef TUSB_CONFIG_H
 #define TUSB_CONFIG_H
 
-#define CFG_TUSB_MCU           11
-#define CFG_TUSB_OS            3
+#ifndef CFG_TUSB_MCU
+#define CFG_TUSB_MCU OPT_MCU_RP2040
+#endif
+
+#ifndef CFG_TUSB_OS
+#define CFG_TUSB_OS OPT_OS_PICO
+#endif
+
 #define CFG_TUD_CDC            0
 #define CFG_TUD_MSC            1
 #define CFG_TUD_HID            0
