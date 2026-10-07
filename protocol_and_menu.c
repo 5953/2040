@@ -1,21 +1,18 @@
-// protocol_and_menu.c - 协议实现和完整菜单系统 (STM8 优化版 v3)
-// 主要修复:
-//   [SWIM] 所有延迟改为 busy_wait_at_least_cycles, 精确到 CPU 周期
-//   [SWIM] 位周期按 T/4 + 3T/4 动态计算, 不再硬编码 1us/3us
-//   [SWIM] 读位采样点修正到位的 T/2 中心
-//   [SWIM] ACK 检测改用硬件定时器 (1us 分辨率)
-//   [SWIM] 入场序列按 16 周期低 + 4 组(4+4) 周期脉冲构造, 时长留 20% 余量
-//   [SWIM] Flash 解锁地址 PUKR(0x5062), 密钥 0x56/0xAE, 检查 PUL 位
+// protocol_and_menu.c - 协议实现和完整菜单系统 (STM8 优化版 + 日志)
+// 主要改动:
+//   [+] 日志系统: 所有 printf 改走 log_write, 同时输出到串口和 LOG.TXT
+//   [SWIM] busy_wait_at_least_cycles 精确时序
+//   [SWIM] Flash 解锁 PUKR(0x5062), 密钥 0x56/0xAE, 检查 PUL
 //   [SWIM] Flash 就绪检查 IAPSR.EOP(0x04)
-//   [SWIM] Flash 擦除 CR2/NCR2 写两个寄存器
-//   [SWD]  读位采样时机修正 + dir_input 关内部上下拉
-//   [SWD]  初始化先低速, 读完 IDCODE 再恢复
-//   [DET]  优先尝试 SWIM (适合刷 STM8)
+//   [SWIM] Flash 擦除 CR2/NCR2
+//   [SWD]  读位采样修正 + dir_input 关内部上下拉
+//   [DET]  优先尝试 SWIM
 #include "stm_programmer.h"
 #include "chip_database.h"
 #include "ff.h"
 #include "hardware/timer.h"
 #include "hardware/clocks.h"
+#include <stdarg.h>
 
 extern programmer_state_t g_state;
 extern menu_state_t g_menu;
@@ -28,59 +25,83 @@ static uint32_t    g_link_dp_idcode = 0;
 static void menu_draw_progress(void);
 
 //=============================================================================
+// 日志系统 (同时输出到串口 + LOG.TXT)
+//=============================================================================
+static FIL   g_log_fil;
+static bool  g_log_open = false;
+
+void log_init(void) {
+    // 每次开机清空重写
+    if (f_open(&g_log_fil, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
+        g_log_open = true;
+    } else {
+        g_log_open = false;
+    }
+}
+
+void log_write(const char *fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+
+    // 串口(如果接了)
+    printf("%s", buf);
+
+    // 文件
+    if (g_log_open) {
+        // USB 正在写时避免冲突
+        if (usb_is_writing()) return;
+        UINT bw;
+        f_write(&g_log_fil, buf, (UINT)strlen(buf), &bw);
+        f_sync(&g_log_fil);
+    }
+}
+
+//=============================================================================
 // SWIM协议实现（STM8）— 精确时序版
 //=============================================================================
 
-// SWIM 时钟周期 (微秒)
-#define SWIM_T_SLOW_US          22      // 复位后慢速 (≈45kHz)
+#define SWIM_T_SLOW_US          22
 
-// STM8 Flash 寄存器
 #define SWIM_CSR_ADDR           0x7F80
 #define FLASH_IAPSR_ADDR        0x505F
 #define FLASH_CR2_ADDR          0x505B
 #define FLASH_NCR2_ADDR         0x505C
-#define FLASH_PUKR_ADDR         0x5062  // 程序 Flash 解锁寄存器
-#define FLASH_DUKR_ADDR         0x5064  // 数据 EEPROM 解锁寄存器
+#define FLASH_PUKR_ADDR         0x5062
+#define FLASH_DUKR_ADDR         0x5064
 
-// IAPSR 位
 #define IAPSR_HALT              0x80
 #define IAPSR_PUL               0x08
 #define IAPSR_EOP               0x04
 #define IAPSR_DUL               0x02
 
-// 时序状态 (运行时会根据 CPU 主频自动更新)
 static uint32_t s_cycles_per_us = 133;
 static uint32_t s_swim_t_us     = SWIM_T_SLOW_US;
 
-// 时序初始化
 static void swim_init_timing(void) {
     s_cycles_per_us = (uint32_t)(clock_get_hz(clk_sys) / 1000000);
     if (s_cycles_per_us == 0) s_cycles_per_us = 133;
 }
 
-// 精确忙等待 N 微秒
 static inline void swim_delay_us(uint32_t us) {
     busy_wait_at_least_cycles(us * s_cycles_per_us);
 }
 
-// GPIO 操作
 static inline void swim_high(void)  { gpio_put(PIN_SWIM_SWDIO, 1); }
 static inline void swim_low(void)   { gpio_put(PIN_SWIM_SWDIO, 0); }
 static inline bool swim_read(void)  { return gpio_get(PIN_SWIM_SWDIO); }
 
-static inline void swim_output(void) {
-    gpio_set_dir(PIN_SWIM_SWDIO, GPIO_OUT);
-}
+static inline void swim_output(void) { gpio_set_dir(PIN_SWIM_SWDIO, GPIO_OUT); }
 
 static inline void swim_input(void) {
     gpio_set_dir(PIN_SWIM_SWDIO, GPIO_IN);
     gpio_disable_pulls(PIN_SWIM_SWDIO);
 }
 
-// --- 入场序列 (UM0470) ---
-// NRST 低 → SWIM 低 16 周期 → 4 组 (高 4 周期 + 低 4 周期) → 释放 NRST
 static bool swim_entry_sequence(void) {
-    // 懒初始化时序
     static bool timing_inited = false;
     if (!timing_inited) {
         swim_init_timing();
@@ -89,19 +110,16 @@ static bool swim_entry_sequence(void) {
 
     swim_output();
 
-    // 把 SWCLK 设为高阻, 避免误接 SWCLK 时干扰 SWIM
+    // SWCLK 设为高阻, 避免误接干扰
     gpio_set_dir(PIN_SWCLK, GPIO_IN);
     gpio_disable_pulls(PIN_SWCLK);
 
-    // 1) NRST 拉低
     gpio_put(PIN_NRST, 0);
     swim_delay_us(100);
 
-    // 2) SWIM 拉低 (16+ 慢速周期, 22*16=352us, 用 450us 保险)
     swim_low();
     swim_delay_us(450);
 
-    // 3) 4 组「高 4 周期 + 低 4 周期」(4*22=88us, 用 100us)
     for (int i = 0; i < 4; i++) {
         swim_high();
         swim_delay_us(100);
@@ -109,18 +127,15 @@ static bool swim_entry_sequence(void) {
         swim_delay_us(100);
     }
 
-    // 4) SWIM 拉高保持
     swim_high();
     swim_delay_us(150);
 
-    // 5) 释放 NRST, 等芯片启动
     gpio_put(PIN_NRST, 1);
     sleep_ms(5);
 
     return true;
 }
 
-// --- 写位: 1 = 低 T/4 + 高 3T/4, 0 = 高 T/4 + 低 3T/4 ---
 static void swim_write_bit(bool bit) {
     swim_output();
 
@@ -129,23 +144,17 @@ static void swim_write_bit(bool bit) {
     uint32_t three_quarter = s_swim_t_us - quarter;
 
     if (bit) {
-        swim_low();
-        swim_delay_us(quarter);
-        swim_high();
-        swim_delay_us(three_quarter);
+        swim_low();  swim_delay_us(quarter);
+        swim_high(); swim_delay_us(three_quarter);
     } else {
-        swim_high();
-        swim_delay_us(quarter);
-        swim_low();
-        swim_delay_us(three_quarter);
+        swim_high(); swim_delay_us(quarter);
+        swim_low();  swim_delay_us(three_quarter);
     }
 }
 
-// --- 写字节: 起始位(0) + 8 数据位(LSB先) + 奇偶位, 等 ACK ---
 static bool swim_write_byte(uint8_t data) {
-    swim_write_bit(0);                      // 起始位
+    swim_write_bit(0);
 
-    // 奇偶校验
     uint8_t parity = data;
     parity ^= parity >> 4;
     parity ^= parity >> 2;
@@ -157,17 +166,14 @@ static bool swim_write_byte(uint8_t data) {
 
     swim_write_bit(parity);
 
-    // 释放线, 等 ACK (从机在下一个位周期内拉低 T/4)
     swim_input();
 
     uint32_t start = timer_hw->timerawl;
     while ((uint32_t)(timer_hw->timerawl - start) < s_swim_t_us) {
         if (!swim_read()) {
-            // 检测到 ACK, 等从机释放
             uint32_t s2 = timer_hw->timerawl;
             while (!swim_read() &&
                    (uint32_t)(timer_hw->timerawl - s2) < s_swim_t_us * 2) {
-                // 等 ACK 结束
             }
             swim_output();
             swim_high();
@@ -179,31 +185,25 @@ static bool swim_write_byte(uint8_t data) {
     return false;
 }
 
-// --- 读字节: 等起始位下降沿, 在每个位的 T/2 处采样 ---
 static bool swim_read_byte(uint8_t *data) {
     swim_input();
 
-    // 等起始位下降沿
     uint32_t timeout = 200000;
     while (swim_read() && --timeout);
     if (!timeout) return false;
 
-    // 下降沿在起始位的 T/4 处, 再等 T/4 到位的中心
     swim_delay_us(s_swim_t_us / 4);
 
-    // 起始位应为 0
     if (swim_read()) return false;
 
-    // 读 8 个数据位 (LSB 先)
     uint8_t value = 0;
     for (int i = 0; i < 8; i++) {
-        swim_delay_us(s_swim_t_us);         // 跳到下一位的中心
+        swim_delay_us(s_swim_t_us);
         if (swim_read()) value |= (1 << i);
     }
 
-    // 奇偶位
     swim_delay_us(s_swim_t_us);
-    swim_read();                            // 丢弃
+    swim_read();
 
     swim_output();
     swim_high();
@@ -212,20 +212,15 @@ static bool swim_read_byte(uint8_t *data) {
     return true;
 }
 
-// --- 读内存 ---
 static bool swim_read_memory(uint32_t addr, uint8_t *data, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint8_t retry = 3;
         bool ok = false;
         while (retry-- && !ok) {
-            ok  = swim_write_byte(0x01);
-            if (!ok) continue;
-            ok  = swim_write_byte((addr >> 16) & 0xFF);
-            if (!ok) continue;
-            ok  = swim_write_byte((addr >> 8)  & 0xFF);
-            if (!ok) continue;
-            ok  = swim_write_byte(addr & 0xFF);
-            if (!ok) continue;
+            ok  = swim_write_byte(0x01); if (!ok) continue;
+            ok  = swim_write_byte((addr >> 16) & 0xFF); if (!ok) continue;
+            ok  = swim_write_byte((addr >> 8)  & 0xFF); if (!ok) continue;
+            ok  = swim_write_byte(addr & 0xFF); if (!ok) continue;
             ok  = swim_read_byte(&data[i]);
         }
         if (!ok) return false;
@@ -234,20 +229,15 @@ static bool swim_read_memory(uint32_t addr, uint8_t *data, uint32_t len) {
     return true;
 }
 
-// --- 写内存 ---
 static bool swim_write_memory(uint32_t addr, const uint8_t *data, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint8_t retry = 3;
         bool ok = false;
         while (retry-- && !ok) {
-            ok  = swim_write_byte(0x02);
-            if (!ok) continue;
-            ok  = swim_write_byte((addr >> 16) & 0xFF);
-            if (!ok) continue;
-            ok  = swim_write_byte((addr >> 8)  & 0xFF);
-            if (!ok) continue;
-            ok  = swim_write_byte(addr & 0xFF);
-            if (!ok) continue;
+            ok  = swim_write_byte(0x02); if (!ok) continue;
+            ok  = swim_write_byte((addr >> 16) & 0xFF); if (!ok) continue;
+            ok  = swim_write_byte((addr >> 8)  & 0xFF); if (!ok) continue;
+            ok  = swim_write_byte(addr & 0xFF); if (!ok) continue;
             ok  = swim_write_byte(data[i]);
         }
         if (!ok) return false;
@@ -256,16 +246,15 @@ static bool swim_write_memory(uint32_t addr, const uint8_t *data, uint32_t len) 
     return true;
 }
 
-// --- SWIM 初始化 ---
 static bool swim_init(void) {
     if (!swim_entry_sequence()) return false;
 
     uint8_t csr;
     if (!swim_read_memory(SWIM_CSR_ADDR, &csr, 1)) {
-        printf("[SWIM] CSR read FAIL\n");
+        log_write("[SWIM] CSR read FAIL\n");
         return false;
     }
-    printf("[SWIM] CSR = 0x%02X\n", csr);
+    log_write("[SWIM] CSR = 0x%02X\n", csr);
     return true;
 }
 
@@ -274,43 +263,41 @@ static bool swim_read_device_id(uint16_t *device_id) {
 
     uint8_t id[2];
     if (!swim_read_memory(0x004850, id, 2)) {
-        printf("[SWIM] DeviceID read FAIL\n");
+        log_write("[SWIM] DeviceID read FAIL\n");
         return false;
     }
 
     *device_id = (id[0] << 8) | id[1];
-    printf("[SWIM] DeviceID = 0x%04X\n", *device_id);
+    log_write("[SWIM] DeviceID = 0x%04X\n", *device_id);
 
     if (*device_id == 0x0000 || *device_id == 0xFFFF) return false;
     return true;
 }
 
-// --- 解锁程序 Flash (PUKR, 0x5062, 密钥 0x56/0xAE) ---
 static bool swim_unlock_flash(void) {
-    printf("[FLASH] unlock PUKR\n");
+    log_write("[FLASH] unlock PUKR\n");
 
     uint8_t key1 = 0x56;
     uint8_t key2 = 0xAE;
     if (!swim_write_memory(FLASH_PUKR_ADDR, &key1, 1)) {
-        printf("[FLASH] key1 write FAIL\n");
+        log_write("[FLASH] key1 write FAIL\n");
         return false;
     }
     if (!swim_write_memory(FLASH_PUKR_ADDR, &key2, 1)) {
-        printf("[FLASH] key2 write FAIL\n");
+        log_write("[FLASH] key2 write FAIL\n");
         return false;
     }
     sleep_ms(10);
 
     uint8_t iapsr;
     if (!swim_read_memory(FLASH_IAPSR_ADDR, &iapsr, 1)) {
-        printf("[FLASH] IAPSR read FAIL\n");
+        log_write("[FLASH] IAPSR read FAIL\n");
         return false;
     }
-    printf("[FLASH] IAPSR = 0x%02X (PUL=%d)\n", iapsr, !!(iapsr & IAPSR_PUL));
+    log_write("[FLASH] IAPSR = 0x%02X (PUL=%d)\n", iapsr, !!(iapsr & IAPSR_PUL));
     return (iapsr & IAPSR_PUL) != 0;
 }
 
-// --- 等 Flash 操作完成 (检查 IAPSR.EOP) ---
 static bool swim_wait_flash_ready(uint32_t timeout_ms) {
     uint32_t start = to_ms_since_boot(get_absolute_time());
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
@@ -319,30 +306,27 @@ static bool swim_wait_flash_ready(uint32_t timeout_ms) {
         if ((iapsr & IAPSR_EOP) != 0) return true;
         sleep_ms(1);
     }
-    printf("[FLASH] wait ready TIMEOUT\n");
+    log_write("[FLASH] wait ready TIMEOUT\n");
     return false;
 }
 
-// --- 全片擦除 ---
 static bool swim_erase_chip(void) {
     if (!swim_unlock_flash()) return false;
 
-    // 写 CR2 / NCR2 使能块擦除
     uint8_t cr2  = 0x02;
     uint8_t ncr2 = (uint8_t)~0x02;
     if (!swim_write_memory(FLASH_CR2_ADDR,  &cr2,  1)) {
-        printf("[FLASH] CR2 write FAIL\n");
+        log_write("[FLASH] CR2 write FAIL\n");
         return false;
     }
     if (!swim_write_memory(FLASH_NCR2_ADDR, &ncr2, 1)) {
-        printf("[FLASH] NCR2 write FAIL\n");
+        log_write("[FLASH] NCR2 write FAIL\n");
         return false;
     }
 
-    // 向块内任意地址写一个字节触发擦除
     uint8_t dummy = 0x00;
     if (!swim_write_memory(0x8000, &dummy, 1)) {
-        printf("[FLASH] erase trigger FAIL\n");
+        log_write("[FLASH] erase trigger FAIL\n");
         return false;
     }
 
@@ -350,7 +334,7 @@ static bool swim_erase_chip(void) {
 }
 
 //=============================================================================
-// SWD协议实现（STM32）— 优化版
+// SWD协议实现（STM32）
 //=============================================================================
 
 static volatile uint32_t g_swd_delay_cycles = 15;
@@ -378,20 +362,9 @@ static inline void swd_dir_output(void) {
     gpio_set_dir(PIN_SWIM_SWDIO, GPIO_OUT);
 }
 
-static inline void swd_clock_low(void) {
-    gpio_put(PIN_SWCLK, 0);
-    swd_delay();
-}
-
-static inline void swd_clock_high(void) {
-    gpio_put(PIN_SWCLK, 1);
-    swd_delay();
-}
-
-static inline void swd_clock(void) {
-    swd_clock_low();
-    swd_clock_high();
-}
+static inline void swd_clock_low(void)  { gpio_put(PIN_SWCLK, 0); swd_delay(); }
+static inline void swd_clock_high(void) { gpio_put(PIN_SWCLK, 1); swd_delay(); }
+static inline void swd_clock(void)      { swd_clock_low(); swd_clock_high(); }
 
 static void swd_write_bit(bool bit) {
     swd_dir_output();
@@ -406,7 +379,7 @@ static void swd_write_bit(bool bit) {
 static bool swd_read_bit(void) {
     swd_dir_input();
     swd_clock_low();
-    swd_clock_high();               // 上升沿, target 驱动数据
+    swd_clock_high();
     bool bit = gpio_get(PIN_SWIM_SWDIO);
     gpio_put(PIN_SWCLK, 0);
     swd_delay();
@@ -430,9 +403,7 @@ static void swd_line_reset(void) {
     for (int i = 0; i < 60; i++) swd_clock();
 
     uint16_t sync = 0xE79E;
-    for (int i = 0; i < 16; i++) {
-        swd_write_bit((sync >> i) & 1);
-    }
+    for (int i = 0; i < 16; i++) swd_write_bit((sync >> i) & 1);
 
     gpio_put(PIN_SWIM_SWDIO, 1);
     for (int i = 0; i < 60; i++) swd_clock();
@@ -457,9 +428,7 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
     request |= (parity ? 0x20 : 0x00);
 
     swd_dir_output();
-    for (int i = 0; i < 8; i++) {
-        swd_write_bit((request >> i) & 1);
-    }
+    for (int i = 0; i < 8; i++) swd_write_bit((request >> i) & 1);
 
     swd_dir_input();
     swd_clock();
@@ -505,11 +474,8 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
     } else {
         swd_dir_output();
         swd_clock();
-
         uint32_t value = *data;
-        for (int i = 0; i < 32; i++) {
-            swd_write_bit((value >> i) & 1);
-        }
+        for (int i = 0; i < 32; i++) swd_write_bit((value >> i) & 1);
         swd_write_bit(calc_parity(value));
     }
 
@@ -521,23 +487,23 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
 
 static bool swd_init(void) {
     uint32_t saved = g_swd_delay_cycles;
-    g_swd_delay_cycles = 100;       // 先低速
+    g_swd_delay_cycles = 100;
 
     gpio_put(PIN_NRST, 0);
     sleep_ms(20);
     gpio_put(PIN_NRST, 1);
     sleep_ms(50);
 
-    printf("[SWD] line reset\n");
+    log_write("[SWD] line reset\n");
     swd_line_reset();
 
     uint32_t idcode = 0;
     if (!swd_transfer(false, true, DP_IDCODE, &idcode)) {
-        printf("[SWD] IDCODE read FAIL\n");
+        log_write("[SWD] IDCODE read FAIL\n");
         g_swd_delay_cycles = saved;
         return false;
     }
-    printf("[SWD] IDCODE = 0x%08lX\n", (unsigned long)idcode);
+    log_write("[SWD] IDCODE = 0x%08lX\n", (unsigned long)idcode);
 
     if (idcode == 0 || idcode == 0xFFFFFFFF) {
         g_swd_delay_cycles = saved;
@@ -632,9 +598,7 @@ static bool stm32_flash_unlock(programmer_state_t *state) {
 
     uint32_t sr;
     if (!swd_read_memory(base + FLASH_SR_OFFSET, (uint8_t*)&sr, 4)) return false;
-    if (base == STM32_F4_FLASH_BASE) {
-        return (sr & 0x02) == 0;
-    }
+    if (base == STM32_F4_FLASH_BASE) return (sr & 0x02) == 0;
     return (sr & 0x80) == 0;
 }
 
@@ -673,7 +637,7 @@ static bool stm32_mass_erase(programmer_state_t *state) {
 }
 
 //=============================================================================
-// Intel HEX解析 (不变)
+// Intel HEX解析
 //=============================================================================
 
 static bool hex_parse_line(const char *line, hex_record_t *record) {
@@ -828,29 +792,28 @@ static void prog_detect_fail(programmer_state_t *state) {
 bool programmer_detect_chip(chip_type_t *type, uint16_t *device_id) {
     const interface_mode_t mode = g_state.config.interface_mode;
 
-    // STM8 (SWIM) 优先
     if (mode != INTERFACE_SWD) {
-        printf("[DET] try SWIM...\n");
+        log_write("[DET] try SWIM...\n");
         if (swim_read_device_id(device_id)) {
             *type = CHIP_TYPE_STM8;
             g_link_type = *type;
             g_link_dev_id = *device_id;
-            printf("[DET] SWIM OK, id=0x%04X\n", *device_id);
+            log_write("[DET] SWIM OK, id=0x%04X\n", *device_id);
             return true;
         }
     }
     if (mode != INTERFACE_SWIM) {
-        printf("[DET] try SWD...\n");
+        log_write("[DET] try SWD...\n");
         if (swd_read_device_id(device_id)) {
             *type = CHIP_TYPE_STM32;
             g_link_type = *type;
             g_link_dev_id = *device_id;
-            printf("[DET] SWD OK, id=0x%04X\n", *device_id);
+            log_write("[DET] SWD OK, id=0x%04X\n", *device_id);
             return true;
         }
     }
     g_link_type = CHIP_TYPE_UNKNOWN;
-    printf("[DET] not detected\n");
+    log_write("[DET] not detected\n");
     return false;
 }
 
@@ -875,6 +838,7 @@ static bool link_guard(programmer_state_t *state, const char *stage) {
     state->error_code = ERR_CONNECTION_UNSTABLE;
     state->prog_state = PROG_STATE_ERROR;
     snprintf(state->prog_message, sizeof(state->prog_message), "连接中断:%s", stage);
+    log_write("[LINK] lost at %s\n", stage);
     prog_ui_update(true);
     return false;
 }
@@ -991,7 +955,7 @@ static bool programmer_write_flash_stream(programmer_state_t *state,
 
     if (is_stm8) {
         if (!swim_unlock_flash()) {
-            printf("[WRITE] unlock FAIL\n");
+            log_write("[WRITE] unlock FAIL\n");
             state->error_code = ERR_WRITE_FAILED;
             return false;
         }
@@ -1009,7 +973,7 @@ static bool programmer_write_flash_stream(programmer_state_t *state,
                                : swd_write_memory(addr + offset, data + offset, write_size);
         if (!success) {
             state->error_code = ERR_WRITE_FAILED;
-            printf("[WRITE] offset 0x%lX FAIL\n", (unsigned long)offset);
+            log_write("[WRITE] offset 0x%lX FAIL\n", (unsigned long)offset);
             return false;
         }
 
@@ -1171,8 +1135,10 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
 
     state->prog_state = PROG_STATE_DETECTING;
     prog_set_message(state, "检测中...");
+    log_write("[PROG] detect...\n");
 
     if (!programmer_auto_detect(state)) {
+        log_write("[PROG] detect FAIL, err=%d\n", state->error_code);
         prog_detect_fail(state);
         return false;
     }
@@ -1181,6 +1147,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         char found_msg[48];
         snprintf(found_msg, sizeof(found_msg), "检测到:%s", state->detected_chip.name);
         prog_set_message(state, found_msg);
+        log_write("[PROG] detected: %s\n", state->detected_chip.name);
     }
     sleep_ms(500);
 
@@ -1191,10 +1158,12 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     uint32_t file_size = 0;
 
     if (!fs_read_file(firmware_file, &file_buffer, &file_size)) {
+        log_write("[PROG] read file FAIL: %s\n", firmware_file);
         state->error_code = ERR_FILE_NOT_FOUND;
         prog_fail(state, "文件未找到");
         return false;
     }
+    log_write("[PROG] loaded %lu bytes\n", (unsigned long)file_size);
 
     uint8_t *bin_data = NULL;
     uint32_t bin_size = 0;
@@ -1206,6 +1175,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         if (!hex_to_bin((char *)file_buffer, file_size, &bin_data, &bin_size, &base_addr)) {
             free(file_buffer);
             state->error_code = ERR_PARSE_HEX;
+            log_write("[PROG] HEX parse FAIL\n");
             prog_fail(state, "HEX解析失败");
             return false;
         }
@@ -1213,6 +1183,8 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         free(file_buffer);
         file_buffer = bin_data;
         file_size = bin_size;
+        log_write("[PROG] HEX -> BIN %lu bytes @ 0x%lX\n",
+                  (unsigned long)file_size, (unsigned long)base_addr);
     } else {
         base_addr = state->detected_chip.flash_addr;
     }
@@ -1240,36 +1212,46 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     if (state->config.auto_erase) {
         state->prog_state = PROG_STATE_ERASING;
         prog_set_message(state, "擦除中...");
+        log_write("[PROG] erase...\n");
 
         if (!programmer_erase_chip(state)) {
             free(file_buffer);
             if (state->error_code != ERR_CONNECTION_UNSTABLE) state->error_code = ERR_ERASE_FAILED;
+            log_write("[PROG] erase FAIL\n");
             prog_fail(state, "擦除失败");
             return false;
         }
+        log_write("[PROG] erase OK\n");
     }
 
     state->prog_state = PROG_STATE_WRITING;
     prog_set_message(state, "烧录中...");
     state->prog_progress = 0;
     state->prog_total = file_size;
+    log_write("[PROG] write %lu bytes @ 0x%lX\n",
+              (unsigned long)file_size, (unsigned long)base_addr);
 
     if (!programmer_write_flash_stream(state, file_buffer, base_addr, file_size)) {
         free(file_buffer);
+        log_write("[PROG] write FAIL\n");
         prog_fail(state, "烧录失败");
         return false;
     }
+    log_write("[PROG] write OK\n");
 
     if (state->config.verify_after_program) {
         state->prog_state = PROG_STATE_VERIFYING;
         prog_set_message(state, "校验中...");
         state->prog_progress = 0;
+        log_write("[PROG] verify...\n");
 
         if (!programmer_verify_flash(state, file_buffer, base_addr, file_size)) {
             free(file_buffer);
+            log_write("[PROG] verify FAIL\n");
             prog_fail(state, "校验失败");
             return false;
         }
+        log_write("[PROG] verify OK\n");
     }
 
     free(file_buffer);
@@ -1277,6 +1259,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     state->prog_state = PROG_STATE_SUCCESS;
     state->prog_progress = state->prog_total;
     prog_set_message(state, "烧录成功!");
+    log_write("[PROG] SUCCESS\n");
 
     return true;
 }
@@ -1286,41 +1269,24 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
 //=============================================================================
 
 static const char *main_menu_items[] = {
-    "开始烧录",
-    "读取备份",
-    "擦除芯片",
-    "固件管理",
-    "选择芯片",
-    "系统设置"
+    "开始烧录", "读取备份", "擦除芯片", "固件管理", "选择芯片", "系统设置"
 };
 #define MAIN_MENU_COUNT 6
 
 static const char *read_menu_items[] = {
-    "读取全部",
-    "读取范围",
-    "备份列表",
-    "芯片信息"
+    "读取全部", "读取范围", "备份列表", "芯片信息"
 };
 #define READ_MENU_COUNT 4
 
 static const char *firmware_menu_items[] = {
-    "固件列表",
-    "删除文件",
-    "文件信息"
+    "固件列表", "删除文件", "文件信息"
 };
 #define FIRMWARE_MENU_COUNT 3
 
 static const char *settings_menu_items[] = {
-    "烧录模式",
-    "接口模式",
-    "稳定检测",
-    "允许未知",
-    "自动校验",
-    "自动备份",
-    "自动擦除",
-    "SWD速度",
-    "屏幕亮度",
-    "恢复默认"
+    "烧录模式", "接口模式", "稳定检测", "允许未知",
+    "自动校验", "自动备份", "自动擦除", "SWD速度",
+    "屏幕亮度", "恢复默认"
 };
 #define SETTINGS_MENU_COUNT 10
 
@@ -1383,7 +1349,6 @@ static void menu_draw_settings(void) {
     int y = MENU_START_Y;
     for (int i = 0; i < MENU_ITEMS_PER_PAGE && (g_menu.scroll_offset + i) < SETTINGS_MENU_COUNT; i++) {
         int index = g_menu.scroll_offset + i;
-
         if (index == g_menu.selected_item) oled_show_string(0, y, ">");
         oled_show_string(10, y, settings_menu_items[index]);
 
@@ -1425,7 +1390,6 @@ static void menu_draw_chip_select(void) {
         }
         y += MENU_LINE_HEIGHT;
     }
-
     menu_draw_scrollbar(g_chip_db_count, g_menu.scroll_offset);
     oled_refresh();
 }
@@ -1441,7 +1405,6 @@ static void menu_draw_firmware_select(void) {
         oled_show_string_clip(10, y, OLED_WIDTH - 14, g_state.file_list[index].filename);
         y += MENU_LINE_HEIGHT;
     }
-
     menu_draw_scrollbar(g_state.file_count, g_menu.scroll_offset);
     oled_refresh();
 }
@@ -1482,12 +1445,10 @@ static void menu_draw_progress(void) {
 static void menu_draw_confirm(const char *message) {
     oled_clear();
     oled_show_string_center(12, message);
-
     oled_show_string(14, 40, g_menu.selected_item == 0 ? ">" : " ");
     oled_show_string(24, 40, "确认");
     oled_show_string(68, 40, g_menu.selected_item == 1 ? ">" : " ");
     oled_show_string(78, 40, "取消");
-
     oled_refresh();
 }
 
@@ -1506,7 +1467,6 @@ static void menu_draw_info(void) {
         oled_show_string_clip(5, y, OLED_WIDTH - 5, buf);
         y += MENU_LINE_HEIGHT;
     }
-
     oled_show_string_center(OLED_HEIGHT - 12, "确认");
     oled_refresh();
 }
@@ -1599,11 +1559,8 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
             if (key == KEY_OK) {
                 switch (menu->selected_item) {
                     case 0:
-                        if (state->file_count > 0) {
-                            menu_goto(menu, MENU_FIRMWARE_SELECT);
-                        } else {
-                            menu_show_info(menu, "提示", "没有可用固件\n请先添加固件文件");
-                        }
+                        if (state->file_count > 0) menu_goto(menu, MENU_FIRMWARE_SELECT);
+                        else menu_show_info(menu, "提示", "没有可用固件\n请先添加固件文件");
                         break;
                     case 1: menu_goto(menu, MENU_READ_BACKUP); break;
                     case 2: menu_goto(menu, MENU_CHIP_ERASE); break;
@@ -1656,11 +1613,8 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
             break;
 
         case MENU_CHIP_ERASE:
-            if (key == KEY_BACK) {
-                menu_goto(menu, MENU_MAIN);
-            } else if (key == KEY_OK) {
-                menu_goto(menu, MENU_CONFIRM);
-            }
+            if (key == KEY_BACK) menu_goto(menu, MENU_MAIN);
+            else if (key == KEY_OK) menu_goto(menu, MENU_CONFIRM);
             break;
 
         case MENU_FIRMWARE_MGMT:
@@ -1739,8 +1693,7 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
         case MENU_FIRMWARE_SELECT:
             menu_navigate(state->file_count, key);
             if (key == KEY_BACK) {
-                menu_id_t back = menu->previous_menu;
-                menu_goto(menu, back);
+                menu_goto(menu, menu->previous_menu);
             } else if (key == KEY_OK && state->file_count > 0) {
                 int sel = menu->selected_item;
                 if (menu->previous_menu == MENU_MAIN) {
@@ -1770,11 +1723,8 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
                 menu->selected_item = !menu->selected_item;
                 menu->need_refresh = true;
             } else if (key == KEY_OK) {
-                if (menu->selected_item == 0) {
-                    menu_start_job(menu, state, 2, 0);
-                } else {
-                    menu_goto(menu, MENU_CHIP_ERASE);
-                }
+                if (menu->selected_item == 0) menu_start_job(menu, state, 2, 0);
+                else menu_goto(menu, MENU_CHIP_ERASE);
             } else if (key == KEY_BACK) {
                 menu_goto(menu, MENU_CHIP_ERASE);
             }
@@ -1782,13 +1732,11 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
 
         case MENU_INFO:
             if (key == KEY_OK || key == KEY_BACK) {
-                menu_id_t back = menu->previous_menu;
-                menu_goto(menu, back);
+                menu_goto(menu, menu->previous_menu);
             }
             break;
 
-        default:
-            break;
+        default: break;
     }
 
     menu_render(menu);
