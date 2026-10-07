@@ -105,7 +105,7 @@ void config_set_default(system_config_t *config) {
     config->magic = CONFIG_MAGIC;
     config->version = CONFIG_VERSION;
     config->program_mode = PROGRAM_MODE_AUTO;
-    config->interface_mode = INTERFACE_AUTO;
+    config->interface_mode = INTERFACE_SWIM;
     config->swd_speed = SWD_SPEED_MEDIUM;
     config->stability_check_enabled = true;
     config->allow_unknown_chip = false;
@@ -143,9 +143,13 @@ bool config_load(system_config_t *config) {
 bool config_save(system_config_t *config) {
     config->crc32 = 0;
     config->crc32 = crc32_calculate((uint8_t *)config, sizeof(system_config_t));
+    // RP2040 flash program operation requires 256-byte aligned length.
+    uint8_t page[256] __attribute__((aligned(4)));
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, config, sizeof(system_config_t));
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(CONFIG_OFFSET, CONFIG_SIZE);
-    flash_range_program(CONFIG_OFFSET, (uint8_t *)config, sizeof(system_config_t));
+    flash_range_program(CONFIG_OFFSET, page, sizeof(page));
     restore_interrupts(ints);
     return true;
 }
@@ -180,6 +184,7 @@ static void hardware_init(void) {
 // 系统初始化
 //=============================================================================
 static bool system_init(void) {
+    usb_storage_init();
     // 屏幕找不到时不退出: 串口会提示, 程序继续运行, 屏幕接好后会自动恢复
     if (!oled_init()) {
         printf("[OLED] 未检测到屏幕 (I2C 0x%02X), 请检查 SDA/SCL 接线\n", OLED_I2C_ADDR);
@@ -225,33 +230,16 @@ static bool system_init(void) {
 // 主循环
 //=============================================================================
 static void main_loop(void) {
-    uint32_t last_link_check = 0;
-
     while (1) {
+        usb_storage_task();
         key_event_t key = keys_scan();
         menu_system_process(&g_menu, key, &g_state);
 
         // 烧录/读取/擦除任务 (阻塞执行, 过程中会自己刷新进度页)
         programmer_task_run(&g_menu, &g_state);
 
-        // 主菜单上每 2 秒刷新一次"已连接"标记
-        // 已连接时只做不复位目标的轻量探测, 未连接时才做完整检测
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-        if (g_menu.current_menu == MENU_MAIN && now - last_link_check > 2000) {
-            last_link_check = now;
-            bool connected;
-            if (g_state.chip_connected) {
-                connected = programmer_link_alive(&g_state);
-            } else {
-                chip_type_t type;
-                uint16_t id;
-                connected = programmer_detect_chip(&type, &id);
-            }
-            if (connected != g_state.chip_connected) {
-                g_state.chip_connected = connected;
-                g_menu.need_refresh = true;
-            }
-        }
+        // 不在主界面自动探测目标芯片。
+        // STM8 SWIM Entry 会主动复位目标，自动轮询会导致目标板反复重启。
 
         sleep_ms(10);
     }

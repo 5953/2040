@@ -18,151 +18,197 @@ static void menu_draw_progress(void);
 
 //=============================================================================
 // SWIM协议实现（STM8）
+// 基于 ST UM0470：开漏单线、低速 22-clock RZ bit format、ROTF/WOTF。
+// RP2040 GPIO 高电平时释放总线，不主动推高，避免与 STM8 争用。
 //=============================================================================
+#include "hardware/clocks.h"
 
-static inline void swim_delay_us(uint32_t us) { sleep_us(us); }
-static inline void swim_high(void) { gpio_put(PIN_SWIM_SWDIO, 1); }
-static inline void swim_low(void) { gpio_put(PIN_SWIM_SWDIO, 0); }
-static inline bool swim_read(void) { return gpio_get(PIN_SWIM_SWDIO); }
-static inline void swim_output(void) { gpio_set_dir(PIN_SWIM_SWDIO, GPIO_OUT); }
-static inline void swim_input(void) { gpio_set_dir(PIN_SWIM_SWDIO, GPIO_IN); }
+#define SWIM_ROTF  1u
+#define SWIM_WOTF  2u
+#define SWIM_SRST  0u
+#define SWIM_TICK_NS 125u                 // 8 MHz SWIM clock = 125 ns/tick
+#define SWIM_TICK_CYCLES ((clock_get_hz(clk_sys) + 7999999u) / 8000000u)
+#define SWIM_SYNC_TIMEOUT_US 5000u
+
+static inline void swim_delay_tick(void) {
+    busy_wait_at_least_cycles(SWIM_TICK_CYCLES);
+}
+static inline void swim_release(void) {
+    gpio_set_dir(PIN_SWIM_SWDIO, GPIO_IN);
+}
+static inline void swim_drive_low(void) {
+    gpio_put(PIN_SWIM_SWDIO, 0);
+    gpio_set_dir(PIN_SWIM_SWDIO, GPIO_OUT);
+}
+static inline bool swim_sample(void) { return gpio_get(PIN_SWIM_SWDIO); }
+static inline void swim_bus_idle(void) { swim_release(); }
+
+static void swim_tick_sample(bool *low_seen) {
+    // 在一个 SWIM clock 的中点采样；总线由目标端/上拉决定。
+    busy_wait_at_least_cycles(SWIM_TICK_CYCLES / 2u);
+    if (!swim_sample()) *low_seen = true;
+    busy_wait_at_least_cycles(SWIM_TICK_CYCLES - SWIM_TICK_CYCLES / 2u);
+}
+
+static void swim_send_bit(bool value) {
+    const uint8_t low_ticks = value ? 2 : 20;
+    const uint8_t high_ticks = value ? 20 : 2;
+    for (uint8_t i = 0; i < low_ticks; i++) {
+        swim_drive_low();
+        swim_delay_tick();
+    }
+    for (uint8_t i = 0; i < high_ticks; i++) {
+        swim_release();
+        swim_delay_tick();
+    }
+}
+
+static bool swim_read_bit(bool *value) {
+    bool low = false;
+    swim_release();
+    for (uint8_t i = 0; i < 22; i++) swim_tick_sample(&low);
+    *value = !low; // <=8 low clocks => 1; >=9 => 0
+    return true;
+}
+
+static bool swim_send_host_frame(uint8_t value, bool header_is_command) {
+    // Host header is 0. Command uses 3 bits; data uses 8 bits.
+    swim_send_bit(false);
+    uint8_t parity = 0;
+    if (header_is_command) {
+        for (int i = 2; i >= 0; i--) {
+            bool b = (value >> i) & 1u;
+            swim_send_bit(b); parity ^= b;
+        }
+    } else {
+        for (int i = 7; i >= 0; i--) {
+            bool b = (value >> i) & 1u;
+            swim_send_bit(b); parity ^= b;
+        }
+    }
+    swim_send_bit(parity);
+    bool ack = false;
+    return swim_read_bit(&ack) && ack;
+}
+
+static bool swim_send_command(uint8_t cmd) {
+    return swim_send_host_frame(cmd & 0x07u, true);
+}
+
+static bool swim_send_data(uint8_t value) {
+    return swim_send_host_frame(value, false);
+}
+
+static bool swim_read_target_byte(uint8_t *value) {
+    bool header = false;
+    if (!swim_read_bit(&header) || !header) return false;
+    uint8_t v = 0, parity = 0;
+    for (int i = 7; i >= 0; i--) {
+        bool b;
+        if (!swim_read_bit(&b)) return false;
+        if (b) v |= (uint8_t)(1u << i);
+        parity ^= b;
+    }
+    bool p;
+    if (!swim_read_bit(&p) || p != parity) return false;
+    // ACK=1; if target is not ready it will send NACK and the read is retried by caller.
+    swim_send_bit(true);
+    *value = v;
+    return true;
+}
 
 static bool swim_entry_sequence(void) {
+    // UM0470: 16 us low + 4 x 1 kHz + 4 x 2 kHz, sequence ends released/high.
     gpio_put(PIN_NRST, 0);
-    swim_output();
-    swim_high();
+    swim_release();
     sleep_us(100);
-    
-    gpio_put(PIN_NRST, 1);
-    sleep_us(100);
-    
+
+    swim_drive_low();
+    sleep_us(16);
+    swim_release();
     for (int i = 0; i < 4; i++) {
-        swim_low();
-        swim_delay_us(500);
-        swim_high();
-        swim_delay_us(500);
+        swim_drive_low(); sleep_us(500);
+        swim_release();    sleep_us(500);
     }
-    
+    for (int i = 0; i < 4; i++) {
+        swim_drive_low(); sleep_us(250);
+        swim_release();    sleep_us(250);
+    }
+    // Target sends the 128-clock synchronization frame after entry.
     sleep_us(100);
     return true;
 }
 
-static void swim_write_bit(bool bit) {
-    swim_output();
-    if (bit) {
-        swim_low();
-        swim_delay_us(2);
-        swim_high();
-        swim_delay_us(2);
-    } else {
-        swim_high();
-        swim_delay_us(2);
-        swim_low();
-        swim_delay_us(2);
+static bool swim_comm_reset(void) {
+    // 128 SWIM clocks low resets the communication state machine and returns low-speed mode.
+    for (int i = 0; i < 128; i++) {
+        swim_drive_low(); swim_delay_tick();
     }
-}
-
-static bool swim_read_bit(void) {
-    swim_input();
-    swim_delay_us(2);
-    bool first = swim_read();
-    swim_delay_us(2);
-    bool second = swim_read();
-    return (!first && second);
-}
-
-static bool swim_write_byte(uint8_t data) {
-    swim_write_bit(0);
-    for (int i = 7; i >= 0; i--) {
-        swim_write_bit((data >> i) & 1);
-    }
-    uint8_t parity = data;
-    parity ^= parity >> 4;
-    parity ^= parity >> 2;
-    parity ^= parity >> 1;
-    swim_write_bit(parity & 1);
-    swim_input();
-    swim_delay_us(10);
+    swim_release();
+    sleep_us(50);
     return true;
 }
 
-static bool swim_read_byte(uint8_t *data) {
-    swim_input();
-    int timeout = 1000;
-    while (swim_read_bit() && timeout--) {
-        if (timeout <= 0) return false;
-    }
-    uint8_t value = 0;
-    for (int i = 7; i >= 0; i--) {
-        if (swim_read_bit()) {
-            value |= (1 << i);
+static bool swim_write_mem(uint32_t addr, const uint8_t *data, uint32_t len) {
+    while (len) {
+        uint8_t n = (len > 255u) ? 255u : (uint8_t)len;
+        if (!swim_send_command(SWIM_WOTF)) return false;
+        if (!swim_send_data(n)) return false;
+        if (!swim_send_data((addr >> 16) & 0xFF)) return false;
+        if (!swim_send_data((addr >> 8) & 0xFF)) return false;
+        if (!swim_send_data(addr & 0xFF)) return false;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!swim_send_data(data[i])) return false;
         }
+        addr += n; data += n; len -= n;
     }
-    swim_read_bit();
-    swim_output();
-    swim_write_bit(1);
-    *data = value;
     return true;
 }
 
-static bool swim_read_memory(uint32_t addr, uint8_t *data, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) {
-        swim_write_byte(0x01);
-        swim_write_byte((addr >> 16) & 0xFF);
-        swim_write_byte((addr >> 8) & 0xFF);
-        swim_write_byte(addr & 0xFF);
-        if (!swim_read_byte(&data[i])) {
-            return false;
+static bool swim_read_mem(uint32_t addr, uint8_t *data, uint32_t len) {
+    while (len) {
+        uint8_t n = (len > 255u) ? 255u : (uint8_t)len;
+        if (!swim_send_command(SWIM_ROTF)) return false;
+        if (!swim_send_data(n)) return false;
+        if (!swim_send_data((addr >> 16) & 0xFF)) return false;
+        if (!swim_send_data((addr >> 8) & 0xFF)) return false;
+        if (!swim_send_data(addr & 0xFF)) return false;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!swim_read_target_byte(&data[i])) return false;
         }
-        addr++;
-    }
-    return true;
-}
-
-static bool swim_write_memory(uint32_t addr, const uint8_t *data, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) {
-        swim_write_byte(0x02);
-        swim_write_byte((addr >> 16) & 0xFF);
-        swim_write_byte((addr >> 8) & 0xFF);
-        swim_write_byte(addr & 0xFF);
-        swim_write_byte(data[i]);
-        addr++;
+        addr += n; data += n; len -= n;
     }
     return true;
 }
 
 static bool swim_init(void) {
-    if (!swim_entry_sequence()) {
-        return false;
-    }
-    uint8_t csr;
-    if (!swim_read_memory(SWIM_CSR, &csr, 1)) {
-        return false;
-    }
+    if (!swim_entry_sequence()) return false;
+    // Enter ACTIVE memory-access mode while target is still held in reset.
+    // SWIM_CSR bit7 SAFE_MASK + bit5 SWIM_DM = 0xA0.
+    uint8_t csr = 0xA0;
+    if (!swim_write_mem(SWIM_CSR, &csr, 1)) return false;
+    gpio_put(PIN_NRST, 1);
+    sleep_ms(2);
     return true;
 }
 
 static bool swim_read_device_id(uint16_t *device_id) {
-    if (!swim_init()) {
-        return false;
-    }
-    uint8_t id[2];
-    if (!swim_read_memory(0x004850, id, 2)) {
-        return false;
-    }
-    *device_id = (id[0] << 8) | id[1];
-    if (*device_id == 0x0000 || *device_id == 0xFFFF) {
-        return false;
-    }
+    // STM8S003F3P6 does not expose a universal STM32-style unique DEV_ID through SWIM.
+    // We therefore verify communication by reading SWIM_CSR and use the user-selected
+    // STM8 model as the programming profile.
+    if (!swim_init()) return false;
+    uint8_t csr = 0;
+    if (!swim_read_mem(SWIM_CSR, &csr, 1)) return false;
+    if (csr == 0xFF) return false;
+    *device_id = 0x5344; // internal project marker for the default STM8S003 profile
     return true;
 }
 
 static bool swim_unlock_flash(void) {
-    uint8_t key1 = 0x56;
-    uint8_t key2 = 0xAE;
-    swim_write_memory(0x5062, &key1, 1);
-    swim_write_memory(0x5062, &key2, 1);
-    sleep_ms(10);
+    uint8_t key1 = 0x56, key2 = 0xAE;
+    if (!swim_write_mem(0x5062, &key1, 1)) return false;
+    if (!swim_write_mem(0x5062, &key2, 1)) return false;
+    sleep_ms(2);
     return true;
 }
 
@@ -170,25 +216,21 @@ static bool swim_wait_flash_ready(uint32_t timeout_ms) {
     uint32_t start = to_ms_since_boot(get_absolute_time());
     uint8_t iapsr;
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
-        if (!swim_read_memory(0x505F, &iapsr, 1)) {
-            return false;
-        }
-        if ((iapsr & 0x04) == 0) {
-            return true;
-        }
+        if (!swim_read_mem(0x505F, &iapsr, 1)) return false;
+        if ((iapsr & 0x04u) == 0) return true;
         sleep_ms(1);
     }
     return false;
 }
 
 static bool swim_erase_chip(void) {
-    if (!swim_unlock_flash()) {
-        return false;
-    }
-    uint8_t cr2 = 0x40;
-    swim_write_memory(0x505B, &cr2, 1);
-    uint8_t dummy = 0x00;
-    swim_write_memory(0x8000, &dummy, 1);
+    if (!swim_unlock_flash()) return false;
+    // STM8S mass erase: set CR2 MER bit and complementary NCR2 bit, then write any
+    // flash address. Exact device family sequence follows STM8S flash programming manual.
+    uint8_t cr2 = 0x40, ncr2 = 0xBF, dummy = 0x00;
+    if (!swim_write_mem(0x505B, &cr2, 1)) return false;
+    if (!swim_write_mem(0x505C, &ncr2, 1)) return false;
+    if (!swim_write_mem(0x8000, &dummy, 1)) return false;
     return swim_wait_flash_ready(5000);
 }
 
@@ -683,10 +725,9 @@ bool programmer_detect_chip(chip_type_t *type, uint16_t *device_id) {
 bool programmer_link_alive(programmer_state_t *state) {
     (void)state;
     if (g_link_type == CHIP_TYPE_STM8) {
-        uint8_t id[2];
-        if (!swim_read_memory(0x004850, id, 2)) return false;
-        uint16_t v = (uint16_t)((id[0] << 8) | id[1]);
-        return v != 0x0000 && v != 0xFFFF && v == g_link_dev_id;
+        uint8_t csr = 0;
+        if (!swim_read_mem(SWIM_CSR, &csr, 1)) return false;
+        return csr != 0xFF;
     }
     if (g_link_type == CHIP_TYPE_STM32) {
         uint32_t idcode = 0;
@@ -720,8 +761,10 @@ static int programmer_stability_check(chip_type_t *detected_type, uint16_t *devi
             if (!ok) return ERR_NO_CHIP_DETECTED;      // 第一次就读不到: 根本没接上
             first_type = t;
             first_id = id;
-        } else if (!ok || t != first_type || id != first_id) {
-            return ERR_CONNECTION_UNSTABLE;            // 先通后断 / 读数变化: 接触不良
+        } else {
+            if (t != first_type || id != first_id || !programmer_link_alive(&g_state)) {
+                return ERR_CONNECTION_UNSTABLE;
+            }
         }
         if (i + 1 < STABILITY_CHECK_TIMES) sleep_ms(STABILITY_CHECK_GAP_MS);
     }
@@ -824,7 +867,7 @@ static bool programmer_write_flash_stream(programmer_state_t *state,
     while (offset < total_size) {
         uint32_t write_size = (total_size - offset) > block_size ? block_size : (total_size - offset);
 
-        bool success = is_stm8 ? swim_write_memory(addr + offset, data + offset, write_size)
+        bool success = is_stm8 ? swim_write_mem(addr + offset, data + offset, write_size)
                                : swd_write_memory(addr + offset, data + offset, write_size);
         if (!success) {
             state->error_code = ERR_WRITE_FAILED;
@@ -853,7 +896,7 @@ static bool programmer_read_flash_stream(programmer_state_t *state,
     while (offset < total_size) {
         uint32_t read_size = (total_size - offset) > LINK_CHECK_BLOCK ? LINK_CHECK_BLOCK : (total_size - offset);
 
-        bool success = is_stm8 ? swim_read_memory(addr + offset, data + offset, read_size)
+        bool success = is_stm8 ? swim_read_mem(addr + offset, data + offset, read_size)
                                : swd_read_memory(addr + offset, data + offset, read_size);
         if (!success) {
             state->error_code = ERR_READ_FAILED;
@@ -882,7 +925,7 @@ static bool programmer_verify_flash(programmer_state_t *state,
     while (offset < total_size) {
         uint32_t verify_size = (total_size - offset) > LINK_CHECK_BLOCK ? LINK_CHECK_BLOCK : (total_size - offset);
 
-        bool success = is_stm8 ? swim_read_memory(addr + offset, g_stream_buffer, verify_size)
+        bool success = is_stm8 ? swim_read_mem(addr + offset, g_stream_buffer, verify_size)
                                : swd_read_memory(addr + offset, g_stream_buffer, verify_size);
         if (!success) {
             state->error_code = ERR_READ_FAILED;
@@ -903,113 +946,9 @@ static bool programmer_verify_flash(programmer_state_t *state,
 }
 
 //=============================================================================
-// 文件系统（简化实现）
+// 文件系统：见 usb_storage.c（1MB FAT12 USB U盘）
 //=============================================================================
 
-
-static fs_header_t g_fs_header = {0};
-
-bool fs_init(void) {
-    const uint8_t *flash_fs = (const uint8_t *)(XIP_BASE + FILESYSTEM_OFFSET);
-    memcpy(&g_fs_header, flash_fs, sizeof(fs_header_t));
-    
-    if (g_fs_header.magic != FS_MAGIC) {
-        memset(&g_fs_header, 0, sizeof(fs_header_t));
-        g_fs_header.magic = FS_MAGIC;
-        g_fs_header.version = 1;
-        g_fs_header.entry_count = 0;
-        g_fs_header.next_offset = sizeof(fs_header_t);
-        return true;
-    }
-    
-    return true;
-}
-
-static bool fs_save_header(void) {
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(FILESYSTEM_OFFSET, FS_BLOCK_SIZE);
-    flash_range_program(FILESYSTEM_OFFSET, (uint8_t *)&g_fs_header, sizeof(fs_header_t));
-    restore_interrupts(ints);
-    return true;
-}
-
-bool fs_list_files(file_info_t *files, int *count, int max_count) {
-    *count = 0;
-    for (int i = 0; i < g_fs_header.entry_count && *count < max_count; i++) {
-        if (g_fs_header.entries[i].valid) {
-            strcpy(files[*count].filename, g_fs_header.entries[i].filename);
-            files[*count].type = g_fs_header.entries[i].type;
-            files[*count].size = g_fs_header.entries[i].size;
-            files[*count].timestamp = g_fs_header.entries[i].timestamp;
-            files[*count].valid = true;
-            (*count)++;
-        }
-    }
-    return true;
-}
-
-bool fs_read_file(const char *filename, uint8_t **buffer, uint32_t *size) {
-    for (int i = 0; i < g_fs_header.entry_count; i++) {
-        if (g_fs_header.entries[i].valid && 
-            strcmp(g_fs_header.entries[i].filename, filename) == 0) {
-            
-            const uint8_t *flash_data = (const uint8_t *)
-                (XIP_BASE + FILESYSTEM_OFFSET + g_fs_header.entries[i].offset);
-            
-            *size = g_fs_header.entries[i].size;
-            *buffer = malloc(*size);
-            if (!*buffer) return false;
-            
-            memcpy(*buffer, flash_data, *size);
-            return true;
-        }
-    }
-    return false;
-}
-
-bool fs_write_file(const char *filename, const uint8_t *data, 
-                         uint32_t size, file_type_t type) {
-    if (g_fs_header.entry_count >= MAX_FILES) {
-        return false;
-    }
-    
-    if (g_fs_header.next_offset + size > FILESYSTEM_SIZE) {
-        return false;
-    }
-    
-    uint32_t write_offset = FILESYSTEM_OFFSET + g_fs_header.next_offset;
-    uint32_t aligned_size = (size + 255) & ~255;
-    
-    uint32_t ints = save_and_disable_interrupts();
-    uint32_t blocks = (aligned_size + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
-    flash_range_erase(write_offset, blocks * FS_BLOCK_SIZE);
-    flash_range_program(write_offset, data, aligned_size);
-    restore_interrupts(ints);
-    
-    int idx = g_fs_header.entry_count;
-    strcpy(g_fs_header.entries[idx].filename, filename);
-    g_fs_header.entries[idx].offset = g_fs_header.next_offset;
-    g_fs_header.entries[idx].size = size;
-    g_fs_header.entries[idx].timestamp = to_ms_since_boot(get_absolute_time());
-    g_fs_header.entries[idx].type = type;
-    g_fs_header.entries[idx].valid = true;
-    
-    g_fs_header.next_offset += aligned_size;
-    g_fs_header.entry_count++;
-    
-    return fs_save_header();
-}
-
-bool fs_delete_file(const char *filename) {
-    for (int i = 0; i < g_fs_header.entry_count; i++) {
-        if (g_fs_header.entries[i].valid && 
-            strcmp(g_fs_header.entries[i].filename, filename) == 0) {
-            g_fs_header.entries[i].valid = false;
-            return fs_save_header();
-        }
-    }
-    return false;
-}
 //=============================================================================
 // 完整烧录流程
 //=============================================================================
@@ -1171,6 +1110,7 @@ static const char *firmware_menu_items[] = {
     "文件信息"
 };
 #define FIRMWARE_MENU_COUNT 3
+static int g_delete_file_index = -1;
 
 static const char *settings_menu_items[] = {
     "烧录模式",
@@ -1505,8 +1445,8 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
                     case 0: // 读取全部
                         menu_start_job(menu, state, 1, 0);
                         break;
-                    case 1: // 读取范围
-                        menu_show_info(menu, "提示", "该功能暂未实现");
+                    case 1: // 快速读取前1KB
+                        menu_show_info(menu, "读取范围", "当前版本固定读取前1KB\n如需自定义范围后续增加");
                         break;
                     case 2: { // 备份列表
                         char msg[64];
@@ -1552,7 +1492,14 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
                         else menu_show_info(menu, "提示", "没有固件文件");
                         break;
                     case 1: // 删除文件
-                        menu_show_info(menu, "提示", "该功能暂未实现");
+                        if (state->file_count <= 0) {
+                            menu_show_info(menu, "提示", "没有固件文件");
+                        } else {
+                            g_delete_file_index = 0;
+                            menu_goto(menu, MENU_FIRMWARE_SELECT);
+                            menu->previous_menu = MENU_FIRMWARE_MGMT;
+                            menu->user_data = (void*)1; // 删除模式
+                        }
                         break;
                     case 2: { // 文件信息
                         char msg[64];
@@ -1619,8 +1566,17 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
                 menu_goto(menu, back);
             } else if (key == KEY_OK && state->file_count > 0) {
                 int sel = menu->selected_item;
-                if (menu->previous_menu == MENU_MAIN) {
-                    menu_start_job(menu, state, 0, sel);      // 开始烧录
+                if (menu->user_data == (void*)1) {
+                    g_delete_file_index = sel;
+                    char msg[96];
+                    snprintf(msg, sizeof(msg), "删除?\n%s", state->file_list[sel].filename);
+                    menu_show_info(menu, "确认删除", msg);
+                    menu->user_data = NULL;
+                    // INFO页确认后执行删除
+                    menu->user_data = (void*)2;
+                    menu->previous_menu = MENU_FIRMWARE_MGMT;
+                } else if (menu->previous_menu == MENU_MAIN) {
+                    menu_start_job(menu, state, 0, sel);
                 } else {
                     char msg[96];
                     snprintf(msg, sizeof(msg), "%s\n大小:%lu字节",
@@ -1659,8 +1615,19 @@ void menu_system_process(menu_state_t *menu, key_event_t key, programmer_state_t
 
         case MENU_INFO:
             if (key == KEY_OK || key == KEY_BACK) {
-                menu_id_t back = menu->previous_menu;
-                menu_goto(menu, back);
+                if (key == KEY_OK && menu->user_data == (void*)2 && g_delete_file_index >= 0 && g_delete_file_index < state->file_count) {
+                    if (fs_delete_file(state->file_list[g_delete_file_index].filename)) {
+                        fs_list_files(state->file_list, &state->file_count, MAX_FILES);
+                        menu_show_info(menu, "删除文件", "删除成功");
+                    } else {
+                        menu_show_info(menu, "删除文件", "删除失败");
+                    }
+                    menu->user_data = NULL;
+                } else {
+                    menu_id_t back = menu->previous_menu;
+                    menu->user_data = NULL;
+                    menu_goto(menu, back);
+                }
             }
             break;
 

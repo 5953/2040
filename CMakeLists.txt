@@ -14,9 +14,11 @@ add_executable(stm_programmer
     oled_font_cn.c            # 汉字点阵 (tools/gen_font.py 自动生成)
     chip_database.c           # 芯片数据库 (在这里添加新型号)
     protocol_and_menu.c       # SWIM/SWD 协议 + 菜单 + 烧录流程
+    usb_storage.c             # 1MB FAT12 USB U盘 + 文件访问
+    usb_descriptors.c         # TinyUSB USB设备描述符
 )
 
-pico_enable_stdio_usb(stm_programmer 1)
+pico_enable_stdio_usb(stm_programmer 0)
 pico_enable_stdio_uart(stm_programmer 0)
 
 pico_add_extra_outputs(stm_programmer)
@@ -29,4 +31,6 @@ target_link_libraries(stm_programmer
     hardware_flash
     hardware_sync
     hardware_clocks
+    tinyusb_device
+    tinyusb_board
 )

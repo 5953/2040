@@ -50,6 +50,8 @@ _Static_assert(sizeof(CHIP_TABLE) / sizeof(CHIP_TABLE[0]) <= MAX_CHIP_DB,
 void chip_db_init(void) {
     g_chip_db_count = 0;
     for (int i = 0; i < CHIP_TABLE_COUNT && g_chip_db_count < MAX_CHIP_DB; i++) {
+        // 当前最终版只启用 STM8；STM32/SWD 保留数据库但暂不加入菜单。
+        if (CHIP_TABLE[i].type != CHIP_TYPE_STM8) continue;
         g_chip_db[g_chip_db_count++] = CHIP_TABLE[i];
     }
 }

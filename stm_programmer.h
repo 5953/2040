@@ -13,6 +13,7 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "hardware/clocks.h"
+#include "tusb.h"
 #include "oled_display.h"
 
 //=============================================================================
@@ -30,18 +31,24 @@
 #define PIN_NRST        4
 
 
-// Flash布局
+// Flash布局（RP2040 2MB Flash）
+// 0x000000-0x0FFFFF：程序/配置/字库等固件空间
+// 0x100000-0x1FFFFF：1MB USB U盘（FAT12）
 #define FLASH_SIZE              (2 * 1024 * 1024)
-#define CONFIG_OFFSET           0x100000
+#define USB_DISK_OFFSET         0x100000
+#define USB_DISK_SIZE           (1 * 1024 * 1024)
+#define USB_DISK_SECTOR_SIZE    512
+#define USB_DISK_SECTOR_COUNT   (USB_DISK_SIZE / USB_DISK_SECTOR_SIZE)
+#define CONFIG_OFFSET           0x0F0000
 #define CONFIG_SIZE             (4 * 1024)
-#define FONT_OFFSET             0x101000
-#define FONT_SIZE               (192 * 1024)
-#define FILESYSTEM_OFFSET       0x131000
-#define FILESYSTEM_SIZE         (828 * 1024)
+#define FONT_OFFSET             0x0F1000
+#define FONT_SIZE               (60 * 1024)
+#define FILESYSTEM_OFFSET       USB_DISK_OFFSET
+#define FILESYSTEM_SIZE         USB_DISK_SIZE
 
 // 缓冲区
 #define STREAM_BUFFER_SIZE      (4 * 1024)
-#define STM8_WRITE_BLOCK        128
+#define STM8_WRITE_BLOCK        64
 #define STM32_WRITE_BLOCK       256
 #define MAX_FILENAME_LEN        64
 #define MAX_PATH_LEN            128
@@ -300,6 +307,11 @@ extern chip_info_t g_chip_db[MAX_CHIP_DB];
 extern int g_chip_db_count;
 extern uint8_t g_stream_buffer[STREAM_BUFFER_SIZE];
 extern firmware_info_t g_firmware_info;
+
+// USB MSC / FAT12
+extern void usb_storage_init(void);
+extern void usb_storage_task(void);
+extern bool usb_storage_format_if_needed(void);
 
 //=============================================================================
 // 函数声明

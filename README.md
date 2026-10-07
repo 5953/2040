@@ -1,34 +1,29 @@
-# STM 离线烧录器 (RP2040-Zero)
+# RP2040-Zero STM8 离线烧录器
 
-树莓派自动编译: GitHub → Actions → Run workflow → 下载 stm_programmer-uf2。
+目标：STM8S003F3P6 优先，STM32/SWD 暂不启用。
 
-## 文件说明
-| 文件 | 作用 |
-|---|---|
-| `main.c` | 按键、CRC、配置、系统初始化、主循环 |
-| `oled_display.c/.h` | **OLED 显示模块** (I2C 驱动、绘图、UTF-8 中英文文字), 主代码只调用 `oled_*` 函数 |
-| `oled_font_cn.c` | 汉字点阵, **自动生成, 不要手改** |
-| `tools/gen_font.py` | 汉字点阵生成脚本 |
-| `chip_database.c/.h` | **芯片数据库**, 在 `CHIP_TABLE` 里加一行就能新增型号 |
-| `protocol_and_menu.c` | SWIM/SWD 协议、菜单、烧录流程、连接稳定性保护 |
-| `stm_programmer.h` | 公共定义 (引脚、结构体、错误码) |
+## Flash布局
+- 0x000000-0x0FFFFF：RP2040程序/OLED/配置
+- 0x100000-0x1FFFFF：1MB FAT12 USB固件盘
 
-## 新增汉字后
-菜单/提示里写了新汉字, 在工程根目录运行一次:
+USB连接电脑后，设备枚举为 Mass Storage，固件可直接复制到盘内；OLED菜单可列出、选择、删除固件。
 
-    python3 tools/gen_font.py
+## 硬件
+- GPIO28 SDA / GPIO29 SCL：0.96寸 SSD1315/SSD1306 I2C OLED
+- GPIO27/26/15/14：K1/K2/K3/K4
+- GPIO2：STM8 SWIM（建议串联 220~1000Ω）
+- GPIO4：STM8 NRST
+- GND：共地
+- 目标STM8必须有合适的VDD；RP2040 GPIO不可承受5V。
 
-会重新生成 `oled_font_cn.c` (需要 `pip install pillow` 和系统里有中文字体; Windows 会自动用宋体)。
-把生成后的 `oled_font_cn.c` 一起提交到 GitHub, Actions 编译时不需要 Python。
-加 `--preview a.png` 可以输出点阵预览图。
+## STM8
+通信按照 ST UM0470 的 SWIM entry、低速22-clock RZ bit、ROTF/WOTF框架实现。STM8S003F3P6 不使用虚构的 STM32 风格 DEV_ID 自动识别；连接成功后采用用户选择的 STM8 型号参数。
 
-## 新增芯片
-编辑 `chip_database.c`:
+首次实机请先验证：SWIM进入、CSR读取、读取0x8000、再做擦除/写入/回读校验。未经过实机验证前，不要把目标板的唯一原始程序当作测试数据。
 
-    STM32_CHIP("型号", DEV_ID, Flash(KB), RAM(KB), 页大小(字节)),
-    STM8_CHIP ("型号", ID,     Flash(KB), RAM(字节), 擦写块(字节)),
-
-## 屏幕参数 (oled_display.h)
-- 屏幕上下颠倒: `OLED_ROTATE_180` 改为 1
-- 屏幕是 1.3 寸 SH1106: `OLED_COLUMN_OFFSET` 改为 2
-- 引脚: `OLED_PIN_SDA` / `OLED_PIN_SCL`, 地址 `OLED_I2C_ADDR`
+## 当前版本说明
+- STM32/SWD：暂不启用。
+- 固件盘：1MB FAT12，直接通过USB Mass Storage访问。
+- 固件管理：列表、文件信息、删除、烧录。
+- 备份：可选整片Flash读取并保存到固件盘。
+- SWIM：使用UM0470低速协议框架；最终硬件验证仍需在实际STM8S003F3P6上用示波器/逻辑分析仪确认时序，再进行首次擦写。
