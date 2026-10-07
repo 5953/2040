@@ -196,20 +196,28 @@ static bool system_init(void) {
     if (idx < 0 || idx >= g_chip_db_count) idx = chip_db_first_index_of_type(CHIP_TYPE_STM8);
     if (idx >= 0) g_state.selected_chip = g_chip_db[idx];
 
-    if (!fs_init()) {
+    // ---- 文件系统 ----
     oled_clear();
-    oled_show_string_center(26, "文件系统初始化失败");
+    oled_show_string_center(26, "挂载文件系统...");
     oled_refresh();
-    sleep_ms(2000);
-    g_state.file_count = 0;
-  } else {
-    log_init();    // ← 加这一行, 开启日志
-    log_write("=== STM Programmer boot ===\n");
-    log_write("[SYS] clock = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
 
-    fs_list_files(g_state.file_list, &g_state.file_count, MAX_FILES);
-    log_write("[FS] %d files\n", g_state.file_count);
-}
+    if (!fs_init()) {
+        oled_clear();
+        oled_show_string_center(26, "文件系统初始化失败");
+        oled_refresh();
+        sleep_ms(2000);
+        g_state.file_count = 0;
+    } else {
+        // 先开日志
+        log_init();
+        log_write("=== STM Programmer boot ===\n");
+        log_write("[SYS] clock = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
+        log_write("[SYS] fs mounted OK\n");
+
+        fs_list_files(g_state.file_list, &g_state.file_count, MAX_FILES);
+        log_write("[FS] %d files\n", g_state.file_count);
+        log_flush();    // 立刻刷一次
+    }
 
     menu_system_init();
     sleep_ms(800);
@@ -221,6 +229,7 @@ static bool system_init(void) {
 //=============================================================================
 static void main_loop(void) {
     uint32_t last_link_check = 0;
+    uint32_t last_log_flush = 0;
 
     while (1) {
         usb_task();
@@ -233,6 +242,13 @@ static void main_loop(void) {
         }
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
+
+        // 每 1 秒把日志刷到文件
+        if (now - last_log_flush > 1000) {
+            last_log_flush = now;
+            log_flush();
+        }
+
         if (g_menu.current_menu == MENU_MAIN && now - last_link_check > 2000) {
             last_link_check = now;
             bool connected;
