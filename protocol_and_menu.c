@@ -27,36 +27,72 @@ static void menu_draw_progress(void);
 //=============================================================================
 // 日志系统 (同时输出到串口 + LOG.TXT)
 //=============================================================================
-static FIL   g_log_fil;
-static bool  g_log_open = false;
+static FIL    g_log_fil;
+static bool   g_log_open = false;
+
+#define LOG_RAM_SIZE 4096
+static char   s_log_ram[LOG_RAM_SIZE];
+static size_t s_log_ram_len = 0;
 
 void log_init(void) {
-    // 每次开机清空重写
-    if (f_open(&g_log_fil, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS) == FR_OK) {
+    g_log_open = false;
+    s_log_ram_len = 0;
+
+    FRESULT fr = f_open(&g_log_fil, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr == FR_OK) {
         g_log_open = true;
     } else {
-        g_log_open = false;
+        // 打开失败也记录下来
+        s_log_ram_len = 0;
+        printf("[LOG] open LOG.TXT FAIL, fr=%d\n", fr);
+    }
+}
+
+void log_flush(void) {
+    if (!g_log_open || s_log_ram_len == 0) return;
+
+    UINT bw = 0;
+    FRESULT fr = f_write(&g_log_fil, s_log_ram, (UINT)s_log_ram_len, &bw);
+    if (fr == FR_OK && bw == s_log_ram_len) {
+        // 写完才 sync
+        f_sync(&g_log_fil);
+        s_log_ram_len = 0;
+    } else {
+        // 写入失败, 丢弃这部分, 避免死循环
+        printf("[LOG] write FAIL fr=%d bw=%u/%u\n", fr, bw, (unsigned)s_log_ram_len);
+        s_log_ram_len = 0;
     }
 }
 
 void log_write(const char *fmt, ...) {
-    char buf[256];
+    char tmp[192];
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, args);
     va_end(args);
     if (n <= 0) return;
 
     // 串口(如果接了)
-    printf("%s", buf);
+    printf("%s", tmp);
 
-    // 文件
-    if (g_log_open) {
-        // USB 正在写时避免冲突
-        if (usb_is_writing()) return;
-        UINT bw;
-        f_write(&g_log_fil, buf, (UINT)strlen(buf), &bw);
-        f_sync(&g_log_fil);
+    // 追加到 RAM 缓冲
+    size_t copy = (size_t)n;
+    if (copy > LOG_RAM_SIZE - 1 - s_log_ram_len) {
+        // 满了, 先刷
+        log_flush();
+        copy = (size_t)n;
+        if (copy > LOG_RAM_SIZE - 1 - s_log_ram_len) {
+            copy = LOG_RAM_SIZE - 1 - s_log_ram_len;
+        }
+    }
+    if (copy == 0) return;
+
+    memcpy(s_log_ram + s_log_ram_len, tmp, copy);
+    s_log_ram_len += copy;
+
+    // 缓冲快满时主动 flush
+    if (s_log_ram_len >= LOG_RAM_SIZE - 256) {
+        log_flush();
     }
 }
 
@@ -252,9 +288,11 @@ static bool swim_init(void) {
     uint8_t csr;
     if (!swim_read_memory(SWIM_CSR_ADDR, &csr, 1)) {
         log_write("[SWIM] CSR read FAIL\n");
+        log_flush();
         return false;
     }
     log_write("[SWIM] CSR = 0x%02X\n", csr);
+    log_flush();
     return true;
 }
 
@@ -264,11 +302,13 @@ static bool swim_read_device_id(uint16_t *device_id) {
     uint8_t id[2];
     if (!swim_read_memory(0x004850, id, 2)) {
         log_write("[SWIM] DeviceID read FAIL\n");
+        log_flush();
         return false;
     }
 
     *device_id = (id[0] << 8) | id[1];
     log_write("[SWIM] DeviceID = 0x%04X\n", *device_id);
+    log_flush();
 
     if (*device_id == 0x0000 || *device_id == 0xFFFF) return false;
     return true;
@@ -276,15 +316,18 @@ static bool swim_read_device_id(uint16_t *device_id) {
 
 static bool swim_unlock_flash(void) {
     log_write("[FLASH] unlock PUKR\n");
+    log_flush();
 
     uint8_t key1 = 0x56;
     uint8_t key2 = 0xAE;
     if (!swim_write_memory(FLASH_PUKR_ADDR, &key1, 1)) {
         log_write("[FLASH] key1 write FAIL\n");
+        log_flush();
         return false;
     }
     if (!swim_write_memory(FLASH_PUKR_ADDR, &key2, 1)) {
         log_write("[FLASH] key2 write FAIL\n");
+        log_flush();
         return false;
     }
     sleep_ms(10);
@@ -292,9 +335,11 @@ static bool swim_unlock_flash(void) {
     uint8_t iapsr;
     if (!swim_read_memory(FLASH_IAPSR_ADDR, &iapsr, 1)) {
         log_write("[FLASH] IAPSR read FAIL\n");
+        log_flush();
         return false;
     }
     log_write("[FLASH] IAPSR = 0x%02X (PUL=%d)\n", iapsr, !!(iapsr & IAPSR_PUL));
+    log_flush();
     return (iapsr & IAPSR_PUL) != 0;
 }
 
@@ -307,6 +352,7 @@ static bool swim_wait_flash_ready(uint32_t timeout_ms) {
         sleep_ms(1);
     }
     log_write("[FLASH] wait ready TIMEOUT\n");
+    log_flush();
     return false;
 }
 
@@ -317,16 +363,19 @@ static bool swim_erase_chip(void) {
     uint8_t ncr2 = (uint8_t)~0x02;
     if (!swim_write_memory(FLASH_CR2_ADDR,  &cr2,  1)) {
         log_write("[FLASH] CR2 write FAIL\n");
+        log_flush();
         return false;
     }
     if (!swim_write_memory(FLASH_NCR2_ADDR, &ncr2, 1)) {
         log_write("[FLASH] NCR2 write FAIL\n");
+        log_flush();
         return false;
     }
 
     uint8_t dummy = 0x00;
     if (!swim_write_memory(0x8000, &dummy, 1)) {
         log_write("[FLASH] erase trigger FAIL\n");
+        log_flush();
         return false;
     }
 
@@ -495,15 +544,18 @@ static bool swd_init(void) {
     sleep_ms(50);
 
     log_write("[SWD] line reset\n");
+    log_flush();
     swd_line_reset();
 
     uint32_t idcode = 0;
     if (!swd_transfer(false, true, DP_IDCODE, &idcode)) {
         log_write("[SWD] IDCODE read FAIL\n");
+        log_flush();
         g_swd_delay_cycles = saved;
         return false;
     }
     log_write("[SWD] IDCODE = 0x%08lX\n", (unsigned long)idcode);
+    log_flush();
 
     if (idcode == 0 || idcode == 0xFFFFFFFF) {
         g_swd_delay_cycles = saved;
@@ -794,11 +846,13 @@ bool programmer_detect_chip(chip_type_t *type, uint16_t *device_id) {
 
     if (mode != INTERFACE_SWD) {
         log_write("[DET] try SWIM...\n");
+        log_flush();
         if (swim_read_device_id(device_id)) {
             *type = CHIP_TYPE_STM8;
             g_link_type = *type;
             g_link_dev_id = *device_id;
             log_write("[DET] SWIM OK, id=0x%04X\n", *device_id);
+            log_flush();  
             return true;
         }
     }
@@ -809,11 +863,13 @@ bool programmer_detect_chip(chip_type_t *type, uint16_t *device_id) {
             g_link_type = *type;
             g_link_dev_id = *device_id;
             log_write("[DET] SWD OK, id=0x%04X\n", *device_id);
+            log_flush();  
             return true;
         }
     }
     g_link_type = CHIP_TYPE_UNKNOWN;
     log_write("[DET] not detected\n");
+    log_flush();  
     return false;
 }
 
@@ -956,6 +1012,7 @@ static bool programmer_write_flash_stream(programmer_state_t *state,
     if (is_stm8) {
         if (!swim_unlock_flash()) {
             log_write("[WRITE] unlock FAIL\n");
+            log_flush();
             state->error_code = ERR_WRITE_FAILED;
             return false;
         }
@@ -974,6 +1031,7 @@ static bool programmer_write_flash_stream(programmer_state_t *state,
         if (!success) {
             state->error_code = ERR_WRITE_FAILED;
             log_write("[WRITE] offset 0x%lX FAIL\n", (unsigned long)offset);
+            log_flush();
             return false;
         }
 
@@ -1136,9 +1194,11 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     state->prog_state = PROG_STATE_DETECTING;
     prog_set_message(state, "检测中...");
     log_write("[PROG] detect...\n");
+    log_flush();
 
     if (!programmer_auto_detect(state)) {
         log_write("[PROG] detect FAIL, err=%d\n", state->error_code);
+        log_flush();
         prog_detect_fail(state);
         return false;
     }
@@ -1148,6 +1208,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         snprintf(found_msg, sizeof(found_msg), "检测到:%s", state->detected_chip.name);
         prog_set_message(state, found_msg);
         log_write("[PROG] detected: %s\n", state->detected_chip.name);
+        log_flush();
     }
     sleep_ms(500);
 
@@ -1159,11 +1220,13 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
 
     if (!fs_read_file(firmware_file, &file_buffer, &file_size)) {
         log_write("[PROG] read file FAIL: %s\n", firmware_file);
+        log_flush();
         state->error_code = ERR_FILE_NOT_FOUND;
         prog_fail(state, "文件未找到");
         return false;
     }
     log_write("[PROG] loaded %lu bytes\n", (unsigned long)file_size);
+    log_flush();
 
     uint8_t *bin_data = NULL;
     uint32_t bin_size = 0;
@@ -1176,6 +1239,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
             free(file_buffer);
             state->error_code = ERR_PARSE_HEX;
             log_write("[PROG] HEX parse FAIL\n");
+            log_flush();
             prog_fail(state, "HEX解析失败");
             return false;
         }
@@ -1185,6 +1249,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         file_size = bin_size;
         log_write("[PROG] HEX -> BIN %lu bytes @ 0x%lX\n",
                   (unsigned long)file_size, (unsigned long)base_addr);
+        log_flush();
     } else {
         base_addr = state->detected_chip.flash_addr;
     }
@@ -1213,15 +1278,18 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
         state->prog_state = PROG_STATE_ERASING;
         prog_set_message(state, "擦除中...");
         log_write("[PROG] erase...\n");
+        log_flush();
 
         if (!programmer_erase_chip(state)) {
             free(file_buffer);
             if (state->error_code != ERR_CONNECTION_UNSTABLE) state->error_code = ERR_ERASE_FAILED;
             log_write("[PROG] erase FAIL\n");
+            log_flush();
             prog_fail(state, "擦除失败");
             return false;
         }
         log_write("[PROG] erase OK\n");
+        log_flush();
     }
 
     state->prog_state = PROG_STATE_WRITING;
@@ -1230,24 +1298,29 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     state->prog_total = file_size;
     log_write("[PROG] write %lu bytes @ 0x%lX\n",
               (unsigned long)file_size, (unsigned long)base_addr);
+    log_flush();
 
     if (!programmer_write_flash_stream(state, file_buffer, base_addr, file_size)) {
         free(file_buffer);
         log_write("[PROG] write FAIL\n");
+        log_flush();
         prog_fail(state, "烧录失败");
         return false;
     }
     log_write("[PROG] write OK\n");
+    log_flush();
 
     if (state->config.verify_after_program) {
         state->prog_state = PROG_STATE_VERIFYING;
         prog_set_message(state, "校验中...");
         state->prog_progress = 0;
         log_write("[PROG] verify...\n");
+        log_flush();
 
         if (!programmer_verify_flash(state, file_buffer, base_addr, file_size)) {
             free(file_buffer);
             log_write("[PROG] verify FAIL\n");
+            log_flush();
             prog_fail(state, "校验失败");
             return false;
         }
@@ -1260,6 +1333,7 @@ bool programmer_full_process(programmer_state_t *state, const char *firmware_fil
     state->prog_progress = state->prog_total;
     prog_set_message(state, "烧录成功!");
     log_write("[PROG] SUCCESS\n");
+    log_flush();
 
     return true;
 }
