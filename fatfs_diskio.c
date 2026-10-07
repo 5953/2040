@@ -25,8 +25,11 @@ DRESULT disk_read(BYTE drv, BYTE* buf, LBA_t sector, UINT count) {
 
 DRESULT disk_write(BYTE drv, const BYTE* buf, LBA_t sector, UINT count) {
     if (drv != 0) return RES_NOTRDY;
+    if (count == 0) return RES_PARERR;
+
     uint32_t total = (uint32_t)count * SECTOR_SIZE;
     uint32_t flash_off = FILESYSTEM_OFFSET + (uint32_t)sector * SECTOR_SIZE;
+    uint32_t written = 0;
 
     while (total > 0) {
         uint32_t block_base = flash_off & ~4095UL;
@@ -34,14 +37,23 @@ DRESULT disk_write(BYTE drv, const BYTE* buf, LBA_t sector, UINT count) {
         uint32_t chunk = (total > (4096 - block_off)) ? (4096 - block_off) : total;
 
         memcpy(s_buf, (const void*)(XIP_BASE + block_base), 4096);
-        memcpy(s_buf + block_off, buf, chunk);
+        memcpy(s_buf + block_off, buf + written, chunk);
 
         uint32_t ints = save_and_disable_interrupts();
         flash_range_erase(block_base, 4096);
         flash_range_program(block_base, s_buf, 4096);
         restore_interrupts(ints);
 
-        buf       += chunk;
+        // ===== 读回验证 =====
+        __dsb();   // 确保内存序
+        const uint8_t *verify = (const uint8_t *)(XIP_BASE + block_base + block_off);
+        for (uint32_t i = 0; i < chunk; i++) {
+            if (verify[i] != buf[written + i]) {
+                return RES_ERROR;   // ← 关键: 让 FatFs 知道写失败
+            }
+        }
+
+        written   += chunk;
         flash_off += chunk;
         total     -= chunk;
     }
