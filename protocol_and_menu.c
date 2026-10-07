@@ -42,20 +42,21 @@ void log_init(void) {
     FRESULT fr = f_open(&g_log_fil, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS);
     if (fr == FR_OK) {
         g_log_open = true;
-        // 屏幕提示
+
+        char disp[64];
+        snprintf(disp, sizeof(disp), "open OK fsz=%lu", 
+                 (unsigned long)f_size(&g_log_fil));
         oled_clear();
-        oled_show_string_center(20, "LOG: open OK");
-        char b[32];
-        snprintf(b, sizeof(b), "fr=%d", fr);
-        oled_show_string_center(40, b);
+        oled_show_string_center(20, "LOG init:");
+        oled_show_string_center(36, disp);
         oled_refresh();
-        sleep_ms(800);
+        sleep_ms(1000);
     } else {
+        char disp[64];
+        snprintf(disp, sizeof(disp), "FAIL fr=%d", fr);
         oled_clear();
-        oled_show_string_center(20, "LOG: open FAIL");
-        char b[32];
-        snprintf(b, sizeof(b), "fr=%d", fr);
-        oled_show_string_center(40, b);
+        oled_show_string_center(20, "LOG init:");
+        oled_show_string_center(36, disp);
         oled_refresh();
         sleep_ms(2000);
     }
@@ -66,21 +67,24 @@ void log_flush(void) {
 
     UINT bw = 0;
     FRESULT fr = f_write(&g_log_fil, s_log_ram, (UINT)s_log_ram_len, &bw);
-    if (fr == FR_OK && bw == s_log_ram_len) {
-        FRESULT fr2 = f_sync(&g_log_fil);
-        if (fr2 != FR_OK) {
-            printf("[LOG] sync FAIL fr=%d\n", fr2);
-        }
-        s_log_ram_len = 0;
-    } else {
-        // 打印更多信息
-        printf("[LOG] write FAIL fr=%d bw=%u want=%u fsize=%lu\n",
-               fr, bw, (unsigned)s_log_ram_len,
-               (unsigned long)f_size(&g_log_fil));
-        s_log_ram_len = 0;
-    }
-}
+    FRESULT fr2 = f_sync(&g_log_fil);
 
+    printf("[LOG] write fr=%d bw=%u want=%u sync=%d fsize=%lu\n",
+           fr, bw, (unsigned)s_log_ram_len, fr2,
+           (unsigned long)f_size(&g_log_fil));
+
+    // 屏幕上显示关键信息
+    char disp[64];
+    snprintf(disp, sizeof(disp), "fr=%d bw=%u fsz=%lu",
+             fr, bw, (unsigned long)f_size(&g_log_fil));
+    oled_clear();
+    oled_show_string_center(20, "LOG write:");
+    oled_show_string_center(36, disp);
+    oled_refresh();
+    sleep_ms(1500);
+
+    s_log_ram_len = 0;
+}
 void log_write(const char *fmt, ...) {
     char tmp[192];
     va_list args;
