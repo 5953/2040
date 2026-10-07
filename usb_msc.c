@@ -34,7 +34,7 @@ static const tusb_desc_device_t desc_device = {
 #define EPNUM_MSC_IN      0x81
 
 static const uint8_t desc_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1,1,0, CONFIG_TOTAL_LEN, 0, 0x80, 100),
+    TUD_CONFIG_DESCRIPTOR(1,1,0, CONFIG_TOTAL_LEN, 0x80, 100),
     TUD_MSC_DESCRIPTOR(0, 3, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
 
