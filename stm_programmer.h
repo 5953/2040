@@ -314,6 +314,11 @@ extern bool programmer_auto_detect(programmer_state_t *state);
 extern bool programmer_erase_chip(programmer_state_t *state);
 extern bool programmer_full_process(programmer_state_t *state, const char *firmware_file);
 
+extern void log_init(void);
+extern void log_write(const char *fmt, ...);
+
+
+
 void swd_set_speed(swd_speed_t speed);
 
 void usb_init(void);
