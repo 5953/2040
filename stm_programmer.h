@@ -320,6 +320,10 @@ extern void log_write(const char *fmt, ...);
 
 
 void swd_set_speed(swd_speed_t speed);
+// 日志系统
+void log_init(void);
+void log_write(const char *fmt, ...);
+void log_flush(void);
 
 void usb_init(void);
 void usb_task(void);
