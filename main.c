@@ -197,14 +197,19 @@ static bool system_init(void) {
     if (idx >= 0) g_state.selected_chip = g_chip_db[idx];
 
     if (!fs_init()) {
-        oled_clear();
-        oled_show_string_center(26, "文件系统初始化失败");
-        oled_refresh();
-        sleep_ms(2000);
-        g_state.file_count = 0;
-    } else {
-        fs_list_files(g_state.file_list, &g_state.file_count, MAX_FILES);
-    }
+    oled_clear();
+    oled_show_string_center(26, "文件系统初始化失败");
+    oled_refresh();
+    sleep_ms(2000);
+    g_state.file_count = 0;
+  } else {
+    log_init();    // ← 加这一行, 开启日志
+    log_write("=== STM Programmer boot ===\n");
+    log_write("[SYS] clock = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
+
+    fs_list_files(g_state.file_list, &g_state.file_count, MAX_FILES);
+    log_write("[FS] %d files\n", g_state.file_count);
+}
 
     menu_system_init();
     sleep_ms(800);
