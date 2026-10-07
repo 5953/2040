@@ -1,6 +1,10 @@
-name: Build RP2040 Firmware
+name: Build STM Programmer
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -8,71 +12,75 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1. 获取 GitHub 仓库代码
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. 安装编译工具
-      - name: Install dependencies
+      - name: Install ARM Toolchain
         run: |
-          sudo apt update
-          sudo apt install -y \
-            cmake \
-            ninja-build \
-            gcc-arm-none-eabi \
-            libnewlib-arm-none-eabi \
-            build-essential \
-            git
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            build-essential libstdc++-arm-none-eabi-newlib python3 git
 
-      # 3. 下载 Raspberry Pi Pico SDK
-      - name: Download Pico SDK
+      - name: Download FatFs
         run: |
-          git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git
-          cd pico-sdk
-          git submodule update --init --depth 1
+          mkdir -p fatfs/source
+          cd fatfs/source
+          wget -q http://elm-chan.org/fsw/ff/arc/ff15.zip || \
+          curl -sL -o ff15.zip http://elm-chan.org/fsw/ff/arc/ff15.zip || \
+          curl -sL -o ff15.zip https://elm-chan.org/fsw/ff/arc/ff15.zip
+          unzip -o ff15.zip
+          rm -f ff15.zip
+          rm -f ffconf.h
+          echo "=== FatFs files ===" && ls -la
+          cd ../..
 
-      # 4. 准备 Pico SDK 导入文件
-      - name: Prepare Pico SDK
+      - name: Verify dependencies
         run: |
-          cp pico-sdk/external/pico_sdk_import.cmake .
+          if [ ! -f fatfs/source/ff.c ]; then
+            echo "ERROR: FatFs download failed, trying GitHub mirror..."
+            cd fatfs/source
+            git clone --depth 1 https://github.com/abbrev/fatfs.git temp_repo
+            cp temp_repo/ff.c temp_repo/ff.h temp_repo/ffsystem.c temp_repo/ffunicode.c temp_repo/diskio.h .
+            rm -rf temp_repo ffconf.h
+            cd ../..
+          fi
+          if [ ! -f pico_sdk_import.cmake ]; then
+            echo "ERROR: pico_sdk_import.cmake missing"
+            exit 1
+          fi
+          echo "All dependencies OK"
 
-      # 5. 配置 CMake
-      - name: Configure
+      - name: Configure CMake
         run: |
-          cmake -S . -B build \
-            -DPICO_SDK_PATH=$GITHUB_WORKSPACE/pico-sdk \
-            -DCMAKE_BUILD_TYPE=Release
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_FETCH_FROM_GIT=ON ..
 
-      # 6. 编译
       - name: Build
         run: |
-          cmake --build build --parallel 2 --verbose
+          cd build
+          make -j$(nproc)
 
-      # 7. 显示生成的文件
-      - name: List build files
-        run: |
-          echo "===== Build output ====="
-          find build -maxdepth 2 -type f \
-            \( -name "*.uf2" -o -name "*.bin" -o -name "*.hex" -o -name "*.elf" \) \
-            -print
+      - name: Show output files
+        run: ls -la build/*.uf2 build/*.elf build/*.hex 2>/dev/null || true
 
-      # 8. 上传 UF2
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
           name: stm_programmer-uf2
-          path: build/*.uf2
+          path: build/stm_programmer.uf2
           if-no-files-found: error
 
-      # 9. 上传其他固件文件
-      - name: Upload firmware files
+      - name: Upload ELF
         uses: actions/upload-artifact@v4
         with:
-          name: stm_programmer-all
-          path: |
-            build/*.uf2
-            build/*.bin
-            build/*.hex
-            build/*.elf
+          name: stm_programmer-elf
+          path: build/stm_programmer.elf
+          if-no-files-found: warn
+
+      - name: Upload HEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm_programmer-hex
+          path: build/stm_programmer.hex
           if-no-files-found: warn
