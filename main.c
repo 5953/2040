@@ -277,6 +277,21 @@ int main(void) {
     hardware_init();
     usb_init();
     system_init();
+
+    // ===== 调试: 立刻写几行日志, 插 USB 前就能写进去 =====
+    log_write("[TEST] === direct test ===\n");
+    log_flush();
+    log_write("[TEST] system_init returned, log system alive\n");
+    log_flush();
+    for (int i = 0; i < 5; i++) {
+        log_write("[TEST] line %d\n", i);
+        log_flush();
+        sleep_ms(200);
+    }
+    log_write("[TEST] === done, going to main_loop ===\n");
+    log_flush();
+    sleep_ms(500);
+
     main_loop();
     return 0;
 }
