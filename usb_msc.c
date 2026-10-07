@@ -34,7 +34,7 @@ static const tusb_desc_device_t desc_device = {
 #define EPNUM_MSC_IN      0x81
 
 static const uint8_t desc_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1, CONFIG_TOTAL_LEN, 0, 0x80, 100),
+    TUD_CONFIG_DESCRIPTOR(1,1,0, CONFIG_TOTAL_LEN, 0, 0x80, 100),
     TUD_MSC_DESCRIPTOR(0, 3, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
 
@@ -159,7 +159,7 @@ void tud_msc_clear_feature_cb(uint8_t lun, uint8_t feature) {
     (void)lun; (void)feature;
 }
 
-uint32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16],
+int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16],
                           void* buffer, uint16_t bufsize) {
     (void)lun; (void)scsi_cmd; (void)buffer; (void)bufsize;
     return 0;
