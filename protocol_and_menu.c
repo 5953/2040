@@ -883,9 +883,6 @@ static bool programmer_verify_flash(programmer_state_t *state,
 static FATFS g_fatfs;
 static FIL   g_fil;
 
-static FATFS g_fatfs;
-static FIL   g_fil;
-
 bool fs_init(void) {
     FRESULT fr = f_mount(&g_fatfs, "", 1);
     if (fr == FR_NO_FILESYSTEM) {
@@ -899,6 +896,7 @@ bool fs_init(void) {
     }
     return (fr == FR_OK);
 }
+
 bool fs_list_files(file_info_t *files, int *count, int max_count) {
     *count = 0;
     DIR dir;
