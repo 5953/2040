@@ -41,10 +41,22 @@ void log_init(void) {
     FRESULT fr = f_open(&g_log_fil, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS);
     if (fr == FR_OK) {
         g_log_open = true;
+        // 屏幕提示
+        oled_clear();
+        oled_show_string_center(20, "LOG: open OK");
+        char b[32];
+        snprintf(b, sizeof(b), "fr=%d", fr);
+        oled_show_string_center(40, b);
+        oled_refresh();
+        sleep_ms(800);
     } else {
-        // 打开失败也记录下来
-        s_log_ram_len = 0;
-        printf("[LOG] open LOG.TXT FAIL, fr=%d\n", fr);
+        oled_clear();
+        oled_show_string_center(20, "LOG: open FAIL");
+        char b[32];
+        snprintf(b, sizeof(b), "fr=%d", fr);
+        oled_show_string_center(40, b);
+        oled_refresh();
+        sleep_ms(2000);
     }
 }
 
@@ -54,12 +66,26 @@ void log_flush(void) {
     UINT bw = 0;
     FRESULT fr = f_write(&g_log_fil, s_log_ram, (UINT)s_log_ram_len, &bw);
     if (fr == FR_OK && bw == s_log_ram_len) {
-        // 写完才 sync
-        f_sync(&g_log_fil);
+        FRESULT fr2 = f_sync(&g_log_fil);
+        if (fr2 != FR_OK) {
+            // sync 失败也显示
+            oled_clear();
+            oled_show_string_center(20, "LOG: sync FAIL");
+            char b[32];
+            snprintf(b, sizeof(b), "fr=%d", fr2);
+            oled_show_string_center(40, b);
+            oled_refresh();
+            sleep_ms(2000);
+        }
         s_log_ram_len = 0;
     } else {
-        // 写入失败, 丢弃这部分, 避免死循环
-        printf("[LOG] write FAIL fr=%d bw=%u/%u\n", fr, bw, (unsigned)s_log_ram_len);
+        oled_clear();
+        oled_show_string_center(20, "LOG: write FAIL");
+        char b[32];
+        snprintf(b, sizeof(b), "fr=%d bw=%u", fr, bw);
+        oled_show_string_center(40, b);
+        oled_refresh();
+        sleep_ms(2000);
         s_log_ram_len = 0;
     }
 }
