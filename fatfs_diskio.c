@@ -60,5 +60,4 @@ DRESULT disk_ioctl(BYTE drv, BYTE cmd, void* buf) {
 }
 
 DWORD get_fattime(void) {
-    return ((DWORD)(2024 - 1980) << 25) | (1 << 21) | (1 << 16) | (0 << 11) | (0 << 5) | 0;
-}
+    return ((DWORD)(2024 - 1980) << 25) | (1 << 21) | (1 << 16) | 

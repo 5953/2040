@@ -40,13 +40,4 @@ target_include_directories(stm_programmer PRIVATE
 )
 
 target_link_libraries(stm_programmer
-    pico_stdlib
-    pico_multicore
-    hardware_i2c
-    hardware_gpio
-    hardware_flash
-    hardware_sync
-    hardware_clocks
-    tinyusb_device
-    fatfs
-)
+    pico
