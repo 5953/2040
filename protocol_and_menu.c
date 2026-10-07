@@ -13,6 +13,7 @@
 #include "hardware/timer.h"
 #include "hardware/clocks.h"
 #include <stdarg.h>
+#include "oled_display.h"
 
 extern programmer_state_t g_state;
 extern menu_state_t g_menu;
