@@ -63,25 +63,39 @@ void log_init(void) {
 }
 
 void log_flush(void) {
-    if (!g_log_open || s_log_ram_len == 0) return;
+    if (s_log_ram_len == 0) return;
+
+    // ★ 每次重新打开, 绕过 fp->err 污染
+    FIL f;
+    FRESULT fr = f_open(&f, "LOG.TXT", FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        char l1[32];
+        snprintf(l1, sizeof(l1), "open=%d", fr);
+        oled_clear();
+        oled_show_string_center(20, "log open fail");
+        oled_show_string_center(36, l1);
+        oled_refresh();
+        sleep_ms(500);
+        s_log_ram_len = 0;
+        return;
+    }
 
     UINT bw = 0;
-    FRESULT fr = f_write(&g_log_fil, s_log_ram, (UINT)s_log_ram_len, &bw);
-    FRESULT fr2 = f_sync(&g_log_fil);
+    FRESULT fw = f_write(&f, s_log_ram, (UINT)s_log_ram_len, &bw);
+    BYTE    ferr = f.err;                    // 写后的 err 值
+    FRESULT fc = f_close(&f);                // f_close 也会 flush 数据
 
-    printf("[LOG] write fr=%d bw=%u want=%u sync=%d fsize=%lu\n",
-           fr, bw, (unsigned)s_log_ram_len, fr2,
-           (unsigned long)f_size(&g_log_fil));
+    // 屏幕显示
+    char l1[32], l2[32];
+    snprintf(l1, sizeof(l1), "w=%d b=%u", fw, bw);
+    snprintf(l2, sizeof(l2), "e=%d c=%d", ferr, fc);
 
-    // 屏幕上显示关键信息
-    char disp[64];
-    snprintf(disp, sizeof(disp), "fr=%d bw=%u fsz=%lu",
-             fr, bw, (unsigned long)f_size(&g_log_fil));
     oled_clear();
-    oled_show_string_center(20, "LOG write:");
-    oled_show_string_center(36, disp);
+    oled_show_string_center(2,  "== log ==");
+    oled_show_string_center(17, l1);
+    oled_show_string_center(32, l2);
     oled_refresh();
-    sleep_ms(1500);
+    sleep_ms(500);      // ★ 从 3000 改成 500, 不再阻塞主循环
 
     s_log_ram_len = 0;
 }
