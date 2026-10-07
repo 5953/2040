@@ -159,6 +159,19 @@ void tud_msc_clear_feature_cb(uint8_t lun, uint8_t feature) {
     (void)lun; (void)feature;
 }
 
+void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4]) {
+    (void)lun;
+    memcpy(vendor_id,  "5953    ", 8);
+    memcpy(product_id, "STM Programmer  ", 16);
+    memcpy(product_rev, "1.0 ", 4);
+}
+
+bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+    (void)lun;
+    return true;
+}
+
+
 int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16],
                           void* buffer, uint16_t bufsize) {
     (void)lun; (void)scsi_cmd; (void)buffer; (void)bufsize;
