@@ -1,10 +1,6 @@
 name: Build STM Programmer
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -21,21 +17,30 @@ jobs:
           sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
             build-essential libstdc++-arm-none-eabi-newlib python3 git
 
-      - name: Download FatFs
+      - name: Configure CMake
         run: |
-          mkdir -p fatfs/source
-          cd fatfs/source
-          wget -q http://elm-chan.org/fsw/ff/arc/ff15.zip || \
-          curl -sL -o ff15.zip http://elm-chan.org/fsw/ff/arc/ff15.zip || \
-          curl -sL -o ff15.zip https://elm-chan.org/fsw/ff/arc/ff15.zip
-          unzip -o ff15.zip
-          rm -f ff15.zip
-          rm -f ffconf.h
-          echo "=== FatFs files ===" && ls -la
-          cd ../..
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_FETCH_FROM_GIT=ON ..
 
-      - name: Verify dependencies
+      - name: Build
         run: |
-          if [ ! -f fatfs/source/ff.c ]; then
-            echo "ERROR: FatFs download failed, trying GitHub mirror..."
-         
+          cd build
+          make -j$(nproc)
+
+      - name: Show output
+        run: ls -la build/*.uf2 2>/dev/null || echo "No UF2 found"
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm_programmer-uf2
+          path: build/stm_programmer.uf2
+          if-no-files-found: error
+
+      - name: Upload ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm_programmer-elf
+          path: build/stm_programmer.elf
+          if-no-files-found: warn
