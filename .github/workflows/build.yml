@@ -11,6 +11,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache Pico SDK
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: pico-sdk-${{ runner.os }}-${{ hashFiles('**/pico_sdk_import.cmake', '**/CMakeLists.txt') }}
+          restore-keys: |
+            pico-sdk-${{ runner.os }}-
+
       - name: Install ARM Toolchain
         run: |
           sudo apt-get update
@@ -27,6 +35,16 @@ jobs:
         run: |
           cd build
           make -j$(nproc)
+
+      - name: Dump CMake logs on failure
+        if: failure()
+        run: |
+          echo "===== CMakeCache (FatFs related) ====="
+          find build -name "CMakeCache.txt" -exec grep -H FATFS {} \; || true
+          echo "===== ffconf.h FF_USE_MKFS ====="
+          find build -name "ffconf.h" -exec grep -H FF_USE_MKFS {} \; || true
+          echo "===== CMakeOutput.log tail ====="
+          tail -200 build/CMakeFiles/CMakeOutput.log || true
 
       - name: Show output
         run: ls -la build/*.uf2 2>/dev/null || echo "No UF2 found"
