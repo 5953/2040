@@ -1,7 +1,10 @@
-// protocol_and_menu.c - 协议实现和完整菜单系统 (STM8 优化版)
-// 修复:
-//   [SWIM] 入场序列按 UM0470 重写
-//   [SWIM] 位时序/读写位重写
+// protocol_and_menu.c - 协议实现和完整菜单系统 (STM8 优化版 v3)
+// 主要修复:
+//   [SWIM] 所有延迟改为 busy_wait_at_least_cycles, 精确到 CPU 周期
+//   [SWIM] 位周期按 T/4 + 3T/4 动态计算, 不再硬编码 1us/3us
+//   [SWIM] 读位采样点修正到位的 T/2 中心
+//   [SWIM] ACK 检测改用硬件定时器 (1us 分辨率)
+//   [SWIM] 入场序列按 16 周期低 + 4 组(4+4) 周期脉冲构造, 时长留 20% 余量
 //   [SWIM] Flash 解锁地址 PUKR(0x5062), 密钥 0x56/0xAE, 检查 PUL 位
 //   [SWIM] Flash 就绪检查 IAPSR.EOP(0x04)
 //   [SWIM] Flash 擦除 CR2/NCR2 写两个寄存器
@@ -11,6 +14,8 @@
 #include "stm_programmer.h"
 #include "chip_database.h"
 #include "ff.h"
+#include "hardware/timer.h"
+#include "hardware/clocks.h"
 
 extern programmer_state_t g_state;
 extern menu_state_t g_menu;
@@ -23,13 +28,13 @@ static uint32_t    g_link_dp_idcode = 0;
 static void menu_draw_progress(void);
 
 //=============================================================================
-// SWIM协议实现（STM8）— 按 UM0470 重写
+// SWIM协议实现（STM8）— 精确时序版
 //=============================================================================
 
-// --- SWIM 时序参数 ---
-#define SWIM_CLK_SLOW_US        22      // 复位后慢速: 22us/bit (45kHz)
+// SWIM 时钟周期 (微秒)
+#define SWIM_T_SLOW_US          22      // 复位后慢速 (≈45kHz)
 
-// SWIM / STM8 Flash 寄存器地址
+// STM8 Flash 寄存器
 #define SWIM_CSR_ADDR           0x7F80
 #define FLASH_IAPSR_ADDR        0x505F
 #define FLASH_CR2_ADDR          0x505B
@@ -37,12 +42,28 @@ static void menu_draw_progress(void);
 #define FLASH_PUKR_ADDR         0x5062  // 程序 Flash 解锁寄存器
 #define FLASH_DUKR_ADDR         0x5064  // 数据 EEPROM 解锁寄存器
 
-// IAPSR 位定义
+// IAPSR 位
 #define IAPSR_HALT              0x80
-#define IAPSR_PUL               0x08    // 程序存储器解锁
-#define IAPSR_EOP               0x04    // 操作完成
-#define IAPSR_DUL               0x02    // 数据 EEPROM 解锁
+#define IAPSR_PUL               0x08
+#define IAPSR_EOP               0x04
+#define IAPSR_DUL               0x02
 
+// 时序状态 (运行时会根据 CPU 主频自动更新)
+static uint32_t s_cycles_per_us = 133;
+static uint32_t s_swim_t_us     = SWIM_T_SLOW_US;
+
+// 时序初始化
+static void swim_init_timing(void) {
+    s_cycles_per_us = (uint32_t)(clock_get_hz(clk_sys) / 1000000);
+    if (s_cycles_per_us == 0) s_cycles_per_us = 133;
+}
+
+// 精确忙等待 N 微秒
+static inline void swim_delay_us(uint32_t us) {
+    busy_wait_at_least_cycles(us * s_cycles_per_us);
+}
+
+// GPIO 操作
 static inline void swim_high(void)  { gpio_put(PIN_SWIM_SWDIO, 1); }
 static inline void swim_low(void)   { gpio_put(PIN_SWIM_SWDIO, 0); }
 static inline bool swim_read(void)  { return gpio_get(PIN_SWIM_SWDIO); }
@@ -53,76 +74,78 @@ static inline void swim_output(void) {
 
 static inline void swim_input(void) {
     gpio_set_dir(PIN_SWIM_SWDIO, GPIO_IN);
-    gpio_disable_pulls(PIN_SWIM_SWDIO);  // 关内部上下拉, 避免干扰 target 驱动
+    gpio_disable_pulls(PIN_SWIM_SWDIO);
 }
 
 // --- 入场序列 (UM0470) ---
-// NRST 拉低 → SWIM 低 16 周期 → 4 组 (高 4 周期 + 低 4 周期) → 释放
+// NRST 低 → SWIM 低 16 周期 → 4 组 (高 4 周期 + 低 4 周期) → 释放 NRST
 static bool swim_entry_sequence(void) {
+    // 懒初始化时序
+    static bool timing_inited = false;
+    if (!timing_inited) {
+        swim_init_timing();
+        timing_inited = true;
+    }
+
     swim_output();
 
+    // 把 SWCLK 设为高阻, 避免误接 SWCLK 时干扰 SWIM
+    gpio_set_dir(PIN_SWCLK, GPIO_IN);
+    gpio_disable_pulls(PIN_SWCLK);
+
+    // 1) NRST 拉低
     gpio_put(PIN_NRST, 0);
-    sleep_us(100);                          // 让芯片进入复位状态
+    swim_delay_us(100);
 
-    // 1) SWIM 保持低 16 个 SWIM 时钟周期
+    // 2) SWIM 拉低 (16+ 慢速周期, 22*16=352us, 用 450us 保险)
     swim_low();
-    sleep_us(16 * SWIM_CLK_SLOW_US);        // ≈ 352us
+    swim_delay_us(450);
 
-    // 2) 4 组「高 4 周期 + 低 4 周期」
+    // 3) 4 组「高 4 周期 + 低 4 周期」(4*22=88us, 用 100us)
     for (int i = 0; i < 4; i++) {
         swim_high();
-        sleep_us(4 * SWIM_CLK_SLOW_US);
+        swim_delay_us(100);
         swim_low();
-        sleep_us(4 * SWIM_CLK_SLOW_US);
+        swim_delay_us(100);
     }
 
-    // 3) 释放 SWIM 并保持
+    // 4) SWIM 拉高保持
     swim_high();
-    sleep_us(6 * SWIM_CLK_SLOW_US);
+    swim_delay_us(150);
 
-    // 4) 释放 NRST
+    // 5) 释放 NRST, 等芯片启动
     gpio_put(PIN_NRST, 1);
-    sleep_us(200);
+    sleep_ms(5);
+
     return true;
 }
 
-// --- 写位: 1 = 低1/4 + 高3/4, 0 = 高1/4 + 低3/4 ---
+// --- 写位: 1 = 低 T/4 + 高 3T/4, 0 = 高 T/4 + 低 3T/4 ---
 static void swim_write_bit(bool bit) {
     swim_output();
+
+    uint32_t quarter = s_swim_t_us / 4;
+    if (quarter == 0) quarter = 1;
+    uint32_t three_quarter = s_swim_t_us - quarter;
+
     if (bit) {
-        swim_low();  sleep_us(1);
-        swim_high(); sleep_us(3);
+        swim_low();
+        swim_delay_us(quarter);
+        swim_high();
+        swim_delay_us(three_quarter);
     } else {
-        swim_high(); sleep_us(1);
-        swim_low();  sleep_us(3);
+        swim_high();
+        swim_delay_us(quarter);
+        swim_low();
+        swim_delay_us(three_quarter);
     }
 }
 
-// --- 读位: 主机释放线, 在位的 T/2 处采样 ---
-// 调用前请确保采样点已对齐 (调用方负责 sleep_us 补足)
-static bool swim_read_bit(void) {
-    swim_input();
-    sleep_us(2);
-    return swim_read();
-}
-
-// 等待起始位的下降沿. 起始位为 0, 高位 1/4 后在 T/4 处下降
-// 返回时已经 sleep 到 T/2, 可直接开始读位
-static bool swim_wait_start_bit(void) {
-    swim_input();
-
-    uint32_t timeout = 100000;
-    while (swim_read() && --timeout);       // 等线拉低
-    if (!timeout) return false;
-
-    sleep_us(1);                            // 从 T/4 走到 T/2
-    return true;
-}
-
-// --- 写字节: 起始位(0) + 8 数据位(LSB first) + 奇偶位, 等 ACK ---
+// --- 写字节: 起始位(0) + 8 数据位(LSB先) + 奇偶位, 等 ACK ---
 static bool swim_write_byte(uint8_t data) {
     swim_write_bit(0);                      // 起始位
 
+    // 奇偶校验
     uint8_t parity = data;
     parity ^= parity >> 4;
     parity ^= parity >> 2;
@@ -134,39 +157,53 @@ static bool swim_write_byte(uint8_t data) {
 
     swim_write_bit(parity);
 
-    // ACK: target 把线拉低一小段时间
+    // 释放线, 等 ACK (从机在下一个位周期内拉低 T/4)
     swim_input();
-    sleep_us(3);
-    uint32_t t = 1000;
-    while (swim_read() && --t);             // 等 ACK 低
-    if (!t) return false;
-    t = 1000;
-    while (!swim_read() && --t);            // 等 ACK 恢复高
-    if (!t) return false;
 
+    uint32_t start = timer_hw->timerawl;
+    while ((uint32_t)(timer_hw->timerawl - start) < s_swim_t_us) {
+        if (!swim_read()) {
+            // 检测到 ACK, 等从机释放
+            uint32_t s2 = timer_hw->timerawl;
+            while (!swim_read() &&
+                   (uint32_t)(timer_hw->timerawl - s2) < s_swim_t_us * 2) {
+                // 等 ACK 结束
+            }
+            swim_output();
+            swim_high();
+            return true;
+        }
+    }
     swim_output();
     swim_high();
-    return true;
+    return false;
 }
 
-// --- 读字节: 等起始位 → 读 8 数据位 + 1 奇偶位 ---
+// --- 读字节: 等起始位下降沿, 在每个位的 T/2 处采样 ---
 static bool swim_read_byte(uint8_t *data) {
-    if (!swim_wait_start_bit()) return false;  // 采样点 = 起始位 T/2
+    swim_input();
 
-    // 起始位本身应该为 0
-    if (swim_read_bit()) return false;
+    // 等起始位下降沿
+    uint32_t timeout = 200000;
+    while (swim_read() && --timeout);
+    if (!timeout) return false;
 
+    // 下降沿在起始位的 T/4 处, 再等 T/4 到位的中心
+    swim_delay_us(s_swim_t_us / 4);
+
+    // 起始位应为 0
+    if (swim_read()) return false;
+
+    // 读 8 个数据位 (LSB 先)
     uint8_t value = 0;
     for (int i = 0; i < 8; i++) {
-        // 每位整周期 T=4us. swim_read_bit() 内部 sleep 2us,
-        // 从 T/2 跳到下一位的 T/2 还差 2us
-        sleep_us(2);
-        if (swim_read_bit()) value |= (1 << i);  // LSB first
+        swim_delay_us(s_swim_t_us);         // 跳到下一位的中心
+        if (swim_read()) value |= (1 << i);
     }
 
     // 奇偶位
-    sleep_us(2);
-    swim_read_bit();                        // 丢弃奇偶校验
+    swim_delay_us(s_swim_t_us);
+    swim_read();                            // 丢弃
 
     swim_output();
     swim_high();
@@ -175,16 +212,21 @@ static bool swim_read_byte(uint8_t *data) {
     return true;
 }
 
+// --- 读内存 ---
 static bool swim_read_memory(uint32_t addr, uint8_t *data, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint8_t retry = 3;
         bool ok = false;
         while (retry-- && !ok) {
-            ok  = swim_write_byte(0x01);    // READ 命令
-            ok &= swim_write_byte((addr >> 16) & 0xFF);
-            ok &= swim_write_byte((addr >> 8)  & 0xFF);
-            ok &= swim_write_byte(addr & 0xFF);
-            ok &= swim_read_byte(&data[i]);
+            ok  = swim_write_byte(0x01);
+            if (!ok) continue;
+            ok  = swim_write_byte((addr >> 16) & 0xFF);
+            if (!ok) continue;
+            ok  = swim_write_byte((addr >> 8)  & 0xFF);
+            if (!ok) continue;
+            ok  = swim_write_byte(addr & 0xFF);
+            if (!ok) continue;
+            ok  = swim_read_byte(&data[i]);
         }
         if (!ok) return false;
         addr++;
@@ -192,16 +234,21 @@ static bool swim_read_memory(uint32_t addr, uint8_t *data, uint32_t len) {
     return true;
 }
 
+// --- 写内存 ---
 static bool swim_write_memory(uint32_t addr, const uint8_t *data, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) {
         uint8_t retry = 3;
         bool ok = false;
         while (retry-- && !ok) {
-            ok  = swim_write_byte(0x02);    // WRITE 命令
-            ok &= swim_write_byte((addr >> 16) & 0xFF);
-            ok &= swim_write_byte((addr >> 8)  & 0xFF);
-            ok &= swim_write_byte(addr & 0xFF);
-            ok &= swim_write_byte(data[i]);
+            ok  = swim_write_byte(0x02);
+            if (!ok) continue;
+            ok  = swim_write_byte((addr >> 16) & 0xFF);
+            if (!ok) continue;
+            ok  = swim_write_byte((addr >> 8)  & 0xFF);
+            if (!ok) continue;
+            ok  = swim_write_byte(addr & 0xFF);
+            if (!ok) continue;
+            ok  = swim_write_byte(data[i]);
         }
         if (!ok) return false;
         addr++;
@@ -209,6 +256,7 @@ static bool swim_write_memory(uint32_t addr, const uint8_t *data, uint32_t len) 
     return true;
 }
 
+// --- SWIM 初始化 ---
 static bool swim_init(void) {
     if (!swim_entry_sequence()) return false;
 
@@ -262,7 +310,7 @@ static bool swim_unlock_flash(void) {
     return (iapsr & IAPSR_PUL) != 0;
 }
 
-// --- 等待 Flash 操作完成 (IAPSR.EOP) ---
+// --- 等 Flash 操作完成 (检查 IAPSR.EOP) ---
 static bool swim_wait_flash_ready(uint32_t timeout_ms) {
     uint32_t start = to_ms_since_boot(get_absolute_time());
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
@@ -351,7 +399,7 @@ static void swd_write_bit(bool bit) {
     swd_delay();
     swd_clock_low();
     swd_clock_high();
-    gpio_put(PIN_SWCLK, 0);         // 补一个下降沿, 保证周期完整
+    gpio_put(PIN_SWCLK, 0);
     swd_delay();
 }
 
@@ -395,7 +443,6 @@ static void swd_line_reset(void) {
     gpio_put(PIN_SWCLK, 0);
 }
 
-// WAIT 重试 + turnaround
 static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
     uint8_t request = 0x81;
     request |= (ap   ? 0x02 : 0x00);
@@ -415,7 +462,7 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
     }
 
     swd_dir_input();
-    swd_clock();                    // turnaround
+    swd_clock();
 
     uint8_t ack = 0;
     for (int i = 0; i < 3; i++) {
@@ -457,7 +504,7 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
         swd_clock();
     } else {
         swd_dir_output();
-        swd_clock();                // turnaround
+        swd_clock();
 
         uint32_t value = *data;
         for (int i = 0; i < 32; i++) {
@@ -473,14 +520,13 @@ static bool swd_transfer(bool ap, bool read, uint8_t addr, uint32_t *data) {
 }
 
 static bool swd_init(void) {
-    // 先切到低速, 保证复位后能可靠通信
     uint32_t saved = g_swd_delay_cycles;
-    g_swd_delay_cycles = 100;       // ≈ 750ns 半周期, ~660kHz
+    g_swd_delay_cycles = 100;       // 先低速
 
     gpio_put(PIN_NRST, 0);
     sleep_ms(20);
     gpio_put(PIN_NRST, 1);
-    sleep_ms(50);                   // STM32 上电到 SWD 可用需要时间
+    sleep_ms(50);
 
     printf("[SWD] line reset\n");
     swd_line_reset();
@@ -738,7 +784,7 @@ parse_done:
 }
 
 //=============================================================================
-// 进度页刷新 / 状态提示 (不变)
+// 进度页刷新 / 状态提示
 //=============================================================================
 
 static void prog_ui_update(bool force) {
@@ -776,8 +822,7 @@ static void prog_detect_fail(programmer_state_t *state) {
 }
 
 //=============================================================================
-// 芯片检测 + 连接稳定性保护
-// STM8 优先 (适合刷 STM8)
+// 芯片检测 (STM8 优先)
 //=============================================================================
 
 bool programmer_detect_chip(chip_type_t *type, uint16_t *device_id) {
