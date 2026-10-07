@@ -209,14 +209,15 @@ static bool system_init(void) {
         g_state.file_count = 0;
     } else {
         // 先开日志
-        log_init();
-        log_write("=== STM Programmer boot ===\n");
-        log_write("[SYS] clock = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
-        log_write("[SYS] fs mounted OK\n");
+        log_init();                                       // ← 加这行
+        log_write("=== STM Programmer boot ===\n");       // ← 加这行
+        log_write("[SYS] clock = %lu Hz\n",               // ← 加这行
+                  (unsigned long)clock_get_hz(clk_sys));
+        log_write("[SYS] fs mounted OK\n");               // ← 加这行
 
         fs_list_files(g_state.file_list, &g_state.file_count, MAX_FILES);
-        log_write("[FS] %d files\n", g_state.file_count);
-        log_flush();    // 立刻刷一次
+        log_write("[FS] %d files\n", g_state.file_count); // ← 加这行
+        log_flush();  
     }
 
     menu_system_init();
@@ -264,7 +265,7 @@ static void main_loop(void) {
                 g_menu.need_refresh = true;
             }
         }
-
+       
         sleep_ms(5);
     }
 }
