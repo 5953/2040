@@ -36,7 +36,7 @@ jobs:
           cd build
           make -j$(nproc)
 
-      - name: Dump CMake logs on failure
+      - name: Dump diagnostics on failure
         if: failure()
         run: |
           echo "===== CMakeCache (FatFs related) ====="
