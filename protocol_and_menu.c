@@ -69,24 +69,14 @@ void log_flush(void) {
     if (fr == FR_OK && bw == s_log_ram_len) {
         FRESULT fr2 = f_sync(&g_log_fil);
         if (fr2 != FR_OK) {
-            // sync 失败也显示
-            oled_clear();
-            oled_show_string_center(20, "LOG: sync FAIL");
-            char b[32];
-            snprintf(b, sizeof(b), "fr=%d", fr2);
-            oled_show_string_center(40, b);
-            oled_refresh();
-            sleep_ms(2000);
+            printf("[LOG] sync FAIL fr=%d\n", fr2);
         }
         s_log_ram_len = 0;
     } else {
-        oled_clear();
-        oled_show_string_center(20, "LOG: write FAIL");
-        char b[32];
-        snprintf(b, sizeof(b), "fr=%d bw=%u", fr, bw);
-        oled_show_string_center(40, b);
-        oled_refresh();
-        sleep_ms(2000);
+        // 打印更多信息
+        printf("[LOG] write FAIL fr=%d bw=%u want=%u fsize=%lu\n",
+               fr, bw, (unsigned)s_log_ram_len,
+               (unsigned long)f_size(&g_log_fil));
         s_log_ram_len = 0;
     }
 }
