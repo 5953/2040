@@ -55,8 +55,9 @@ endif()
 message(STATUS "Using FatFs: ${FATFS_SOURCE_DIR}")
 
 # ===== 强制打开 FF_USE_MKFS =====
-# SDK 自带的 ffconf.h 里 FF_USE_MKFS 硬编码为 0, 命令行 -D 会被它覆盖.
-# 所以在 CMake 配置阶段直接 patch 它, 并做幂等判断 (已经是 1 就跳过).
+# SDK 自带的 ffconf.h 里 FF_USE_MKFS 硬编码为 0, 命令行 -DFF_USE_MKFS=1 会被它覆盖,
+# 导致 f_mkfs 根本没被编译进 ff.c.o, 链接时报 undefined reference.
+# 解决办法: 在 CMake 配置阶段直接把 ffconf.h 里的 0 改成 1 (幂等, 重复跑不会重复改).
 set(FATFS_FFCONF "${FATFS_SOURCE_DIR}/ffconf.h")
 if(EXISTS "${FATFS_FFCONF}")
     file(READ "${FATFS_FFCONF}" _ffconf_content)
@@ -76,7 +77,11 @@ else()
     message(WARNING "未找到 ffconf.h: ${FATFS_FFCONF}")
 endif()
 
-file(GLOB FATFS_SOURCES "${FATFS_SOURCE_DIR}/ff.c" "${FATFS_SOURCE_DIR}/ffsystem.c" "${FATFS_SOURCE_DIR}/ffunicode.c")
+file(GLOB FATFS_SOURCES
+    "${FATFS_SOURCE_DIR}/ff.c"
+    "${FATFS_SOURCE_DIR}/ffsystem.c"
+    "${FATFS_SOURCE_DIR}/ffunicode.c"
+)
 
 add_library(fatfs STATIC ${FATFS_SOURCES})
 target_include_directories(fatfs PUBLIC
