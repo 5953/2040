@@ -887,16 +887,10 @@ bool fs_init(void) {
     FRESULT fr = f_mount(&g_fatfs, "", 1);
     if (fr == FR_NO_FILESYSTEM) {
         static BYTE work_buf[4096];
-        #ifdef MKFS_PARM
-            // FatFs R0.13+
-            MKFS_PARM parm;
-            memset(&parm, 0, sizeof(parm));
-            parm.fmt = FM_FAT;
-            fr = f_mkfs("", &parm, work_buf, sizeof(work_buf));
-        #else
-            // FatFs R0.12
-            fr = f_mkfs("", 0, 0, work_buf, sizeof(work_buf));
-        #endif
+        MKFS_PARM parm;
+        memset(&parm, 0, sizeof(parm));
+        parm.fmt = FM_FAT;
+        fr = f_mkfs("", &parm, work_buf, sizeof(work_buf));
         if (fr != FR_OK) return false;
         fr = f_mount(&g_fatfs, "", 1);
     }
